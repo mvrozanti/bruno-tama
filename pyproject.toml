@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bruno"
+version = "0.1.0"
+description = "a dot-blob tamagotchi that lives in your tmux pane"
+readme = { text = "bruno is a small ASCII creature that walks around your tmux pane, gets hungry, sleeps, and occasionally has thoughts.", content-type = "text/plain" }
+requires-python = ">=3.10"
+authors = [{ name = "m", email = "mvrozanti@gmail.com" }]
+license = { text = "MIT" }
+dependencies = [
+  "pyte>=0.8",
+]
+
+[project.scripts]
+bruno = "bruno.__main__:main"
+
+[tool.setuptools]
+packages = ["bruno"]
