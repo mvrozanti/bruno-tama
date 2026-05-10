@@ -11,7 +11,7 @@
     in {
       packages = forAllSystems (system: pkgs: {
         default = pkgs.python3Packages.buildPythonApplication {
-          pname = "bruno";
+          pname = "bruno-tama";
           version = "0.1.0";
           pyproject = true;
           src = ./.;
