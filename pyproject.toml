@@ -6,15 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "bruno-tama"
 version = "0.1.0"
 description = "a dot-blob tamagotchi that overlays on your live shell"
-readme = { text = """\
-bruno is a small ASCII creature that lives on top of your shell. He walks
-through whatever empty space your terminal has, squishes when blocked,
-teleports to a fresh clear spot, and hides when the pane is full. Wraps
-$SHELL in a PTY so he coexists with whatever you're typing.
-
-  pipx install bruno-tama
-  bruno
-""", content-type = "text/plain" }
+readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "mvrozanti", email = "mvrozanti@gmail.com" }]
 license = { text = "MIT" }
