@@ -74,6 +74,77 @@ def _cell_empty(screen: pyte.Screen, x: int, y: int) -> bool:
     return _cell_char(screen, x, y) == " "
 
 
+_NAMED_FG = {
+    "black": "30", "red": "31", "green": "32", "brown": "33",
+    "blue": "34", "magenta": "35", "cyan": "36", "white": "37",
+    "default": "39",
+    "brightblack": "90", "brightred": "91", "brightgreen": "92",
+    "brightbrown": "93", "brightblue": "94", "brightmagenta": "95",
+    "brightcyan": "96", "brightwhite": "97",
+}
+_NAMED_BG = {
+    "black": "40", "red": "41", "green": "42", "brown": "43",
+    "blue": "44", "magenta": "45", "cyan": "46", "white": "47",
+    "default": "49",
+    "brightblack": "100", "brightred": "101", "brightgreen": "102",
+    "brightbrown": "103", "brightblue": "104", "brightmagenta": "105",
+    "brightcyan": "106", "brightwhite": "107",
+}
+
+
+def _color_sgr(color: str, fg: bool) -> str | None:
+    """Convert a pyte color name or 6-hex string to an SGR fragment."""
+    if not color or color == "default":
+        return "39" if fg else "49"
+    table = _NAMED_FG if fg else _NAMED_BG
+    if color in table:
+        return table[color]
+    if len(color) == 6:
+        try:
+            r = int(color[0:2], 16)
+            g = int(color[2:4], 16)
+            b = int(color[4:6], 16)
+            return f"{'38' if fg else '48'};2;{r};{g};{b}"
+        except ValueError:
+            return None
+    return None
+
+
+def _cell_paint(screen: pyte.Screen, x: int, y: int) -> str:
+    """Return `<SGR><char>` so a restored cell keeps its fg/bg/attrs.
+
+    Without this, repainting a cell bruno used to occupy emits the
+    character with the SGR state that happened to be active — typically
+    the renderer's RESET_SGR — and erases the prompt's coloring at that
+    position. Read pyte's attribute view of the cell and emit a matching
+    SGR before the character.
+    """
+    if y < 0 or y >= screen.lines or x < 0 or x >= screen.columns:
+        return RESET_SGR + " "
+    cell = screen.buffer[y][x]
+    ch = cell.data or " "
+    parts = ["0"]
+    if cell.bold:
+        parts.append("1")
+    if cell.italics:
+        parts.append("3")
+    if cell.underscore:
+        parts.append("4")
+    if cell.blink:
+        parts.append("5")
+    if cell.reverse:
+        parts.append("7")
+    if cell.strikethrough:
+        parts.append("9")
+    fg = _color_sgr(cell.fg, fg=True)
+    if fg and fg != "39":
+        parts.append(fg)
+    bg = _color_sgr(cell.bg, fg=False)
+    if bg and bg != "49":
+        parts.append(bg)
+    return f"{ESC}[{';'.join(parts)}m{ch}"
+
+
 def _can_place(screen: pyte.Screen, sprite_lines: list[str], x: int, y: int,
                cols: int, rows: int) -> bool:
     if x < 0 or y < 0:
@@ -139,15 +210,16 @@ class Compositor:
                     out.append(_move_to(row, col) + DIM_SGR + ch + RESET_SGR)
 
         # Restore cells we owned last tick that we don't own this tick.
-        # Use whatever pyte reports for the underlying shell content.
+        # Use whatever pyte reports for the underlying shell content,
+        # including its SGR state — otherwise we strip the prompt's
+        # colors when bruno walks off them.
         all_old = self._last_cells | self._last_bubble_cells
         all_new = new_cells | new_bubble_cells
         stale = all_old - all_new
         for row, col in stale:
-            ch = _cell_char(self.screen, col, row)
-            out.append(_move_to(row, col) + ch)
+            out.append(_move_to(row, col) + _cell_paint(self.screen, col, row))
 
-        out.append(RESTORE_CUR)
+        out.append(RESET_SGR + RESTORE_CUR)
         if self._debug:
             self._debug.write(
                 f"render: new={sorted(new_cells)} stale={sorted(stale)} "
@@ -162,11 +234,10 @@ class Compositor:
         all_old = self._last_cells | self._last_bubble_cells
         if not all_old:
             return
-        out = [SAVE_CUR, RESET_SGR]
+        out = [SAVE_CUR]
         for row, col in all_old:
-            ch = _cell_char(self.screen, col, row)
-            out.append(_move_to(row, col) + ch)
-        out.append(RESTORE_CUR)
+            out.append(_move_to(row, col) + _cell_paint(self.screen, col, row))
+        out.append(RESET_SGR + RESTORE_CUR)
         try:
             os.write(self.stdout_fd, "".join(out).encode("utf-8", errors="replace"))
         except OSError:
@@ -178,16 +249,15 @@ class Compositor:
         all_old = self._last_cells | self._last_bubble_cells
         if not all_old:
             return
-        out = [SAVE_CUR, RESET_SGR]
+        out = [SAVE_CUR]
         wrote = False
         for row, col in all_old:
             new_row = row - delta
             if new_row < 0 or new_row >= rows:
                 continue
-            ch = _cell_char(self.screen, col, new_row)
-            out.append(_move_to(new_row, col) + ch)
+            out.append(_move_to(new_row, col) + _cell_paint(self.screen, col, new_row))
             wrote = True
-        out.append(RESTORE_CUR)
+        out.append(RESET_SGR + RESTORE_CUR)
         if wrote:
             try:
                 os.write(self.stdout_fd, "".join(out).encode("utf-8", errors="replace"))
