@@ -105,7 +105,11 @@ class Compositor:
                bubble_lines: list[str] | None, bx: int, by: int) -> None:
         new_cells: set[tuple[int, int]] = set()
         new_bubble_cells: set[tuple[int, int]] = set()
-        out: list[str] = [SAVE_CUR, HIDE_CURSOR, RESET_SGR]
+        # Don't HIDE_CURSOR here — it has no paired SHOW, so the cursor
+        # stays invisible across long-running shell output. A 1-frame
+        # cursor flicker on bruno's cell is invisible; a permanently
+        # hidden cursor is reported as "the terminal is broken."
+        out: list[str] = [SAVE_CUR, RESET_SGR]
 
         for dy, line in enumerate(sprite_lines):
             for dx, ch in enumerate(line):
@@ -167,6 +171,28 @@ class Compositor:
             os.write(self.stdout_fd, "".join(out).encode("utf-8", errors="replace"))
         except OSError:
             pass
+        self._last_cells.clear()
+        self._last_bubble_cells.clear()
+
+    def handle_scroll(self, delta: int, rows: int) -> None:
+        all_old = self._last_cells | self._last_bubble_cells
+        if not all_old:
+            return
+        out = [SAVE_CUR, RESET_SGR]
+        wrote = False
+        for row, col in all_old:
+            new_row = row - delta
+            if new_row < 0 or new_row >= rows:
+                continue
+            ch = _cell_char(self.screen, col, new_row)
+            out.append(_move_to(new_row, col) + ch)
+            wrote = True
+        out.append(RESTORE_CUR)
+        if wrote:
+            try:
+                os.write(self.stdout_fd, "".join(out).encode("utf-8", errors="replace"))
+            except OSError:
+                pass
         self._last_cells.clear()
         self._last_bubble_cells.clear()
 
@@ -281,20 +307,25 @@ def run(args) -> int:
     if os.environ.get("BRUNO_DEBUG"):
         debug_log = open(os.environ["BRUNO_DEBUG"], "a", buffering=1)
 
+    occupancy: set[tuple[int, int]] = set()
+
+    def _rebuild_occupancy():
+        occupancy.clear()
+        buf = screen.buffer
+        for y in range(rows):
+            row_buf = buf[y]
+            for x in range(cols):
+                ch = row_buf[x].data
+                if ch and ch != " ":
+                    occupancy.add((x, y))
+
     def _can_place(x, y, w, h):
         if x < 0 or y < 0 or x + w > cols or y + h > rows:
             return False
         for dy in range(h):
             for dx in range(w):
-                if not _cell_empty(screen, x + dx, y + dy):
-                    if debug_log:
-                        debug_log.write(
-                            f"deny ({x},{y},{w}x{h}) — pyte({x+dx},{y+dy})="
-                            f"{_cell_char(screen, x + dx, y + dy)!r}\n"
-                        )
+                if (x + dx, y + dy) in occupancy:
                     return False
-        if debug_log:
-            debug_log.write(f"allow ({x},{y},{w}x{h})\n")
         return True
 
     bruno = Bruno(cols, rows, dev_mode=args.dev, can_place=_can_place)
@@ -336,6 +367,12 @@ def run(args) -> int:
     activity_idle_ticks = 0
     bubble_text: str | None = None
     bubble_until = 0.0
+    # If shell bytes arrived very recently, an os.read boundary may have
+    # split an escape sequence; injecting our SAVE_CUR / cursor-move into
+    # the middle of that sequence corrupts the terminal. Wait for the
+    # stream to settle before overlaying.
+    shell_settle_s = 0.04
+    last_shell_byte = 0.0
 
     try:
         while True:
@@ -371,7 +408,6 @@ def run(args) -> int:
                 except OSError:
                     pass
 
-            shell_wrote = False
             if master_fd in r:
                 try:
                     data = os.read(master_fd, 8192)
@@ -379,47 +415,53 @@ def run(args) -> int:
                     break
                 if not data:
                     break
+                # Drain everything immediately available so a single read
+                # boundary doesn't strand a partial escape sequence on the
+                # terminal while we go off to render.
+                while True:
+                    try:
+                        r2, _, _ = select.select([master_fd], [], [], 0)
+                    except (InterruptedError, OSError):
+                        break
+                    if master_fd not in r2:
+                        break
+                    try:
+                        more = os.read(master_fd, 8192)
+                    except OSError:
+                        more = b""
+                    if not more:
+                        break
+                    data += more
                 stream.feed(data)
                 try:
                     os.write(sys.stdout.fileno(), data)
                 except OSError:
                     pass
-                shell_wrote = True
                 activity_idle_ticks = 0
+                last_shell_byte = time.monotonic()
 
-                # On scroll, the terminal moves bruno's last-drawn chars
-                # to unpredictable rows (and pyte's view of "what was at
-                # those positions" is now also shifted). Rather than try
-                # to track each cell, repaint pyte's whole buffer over the
-                # terminal — this is the source of truth for shell content.
-                # Bruno's overlay will then redraw on top in the next render.
+                # On scroll, the terminal already shifted bruno's last-drawn
+                # cells along with everything else; pyte's buffer scrolled in
+                # lockstep. Only cells *we* drew need correcting — repaint
+                # them at their shifted positions with whatever pyte now
+                # shows there. Bruno re-overlays on the next tick.
                 if screen.scroll_delta:
+                    compositor.handle_scroll(screen.scroll_delta, rows)
                     screen.scroll_delta = 0
-                    out = [SAVE_CUR]
-                    for row in range(rows):
-                        out.append(_move_to(row, 0))
-                        line_chars = []
-                        for col in range(cols):
-                            ch = _cell_char(screen, col, row)
-                            line_chars.append(ch if ch else " ")
-                        out.append("".join(line_chars))
-                    out.append(RESTORE_CUR)
-                    try:
-                        os.write(sys.stdout.fileno(),
-                                 "".join(out).encode("utf-8", errors="replace"))
-                    except OSError:
-                        pass
-                    compositor._last_cells.clear()
-                    compositor._last_bubble_cells.clear()
 
             now = time.monotonic()
-            if now >= next_tick or shell_wrote:
-                if now >= next_tick:
-                    next_tick += tick_interval
-                    if next_tick < now:
-                        next_tick = now + tick_interval
-                    bruno.tick_once()
-                    activity_idle_ticks += 1
+            if now >= next_tick:
+                next_tick += tick_interval
+                if next_tick < now:
+                    next_tick = now + tick_interval
+                # Skip the overlay this tick if the shell just wrote — the
+                # last byte may be the head of an unterminated escape and
+                # our SAVE_CUR would get parsed as its parameters.
+                if now - last_shell_byte < shell_settle_s:
+                    continue
+                _rebuild_occupancy()
+                bruno.tick_once()
+                activity_idle_ticks += 1
 
                 # Handle displacement: if bruno's current spot now has content,
                 # try to teleport to a clear spot. Otherwise just hide him.

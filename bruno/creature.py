@@ -190,20 +190,21 @@ class Bruno:
                         near_y: int | None = None) -> tuple[int, int] | None:
         """Search the pane for a wxh rectangle the can_place predicate accepts.
         Returns (x, y) or None. Searches in expanding rings around (near_x, near_y)
-        if given, else from the center."""
+        if given, else from the center, exiting on the first match."""
         cx = near_x if near_x is not None else self.pane_w // 2
         cy = near_y if near_y is not None else self.pane_h // 2
-        # Search candidates in spiral-ish order
-        candidates = []
-        for radius in range(max(self.pane_w, self.pane_h)):
-            for dy in range(-radius, radius + 1):
-                for dx in range(-radius, radius + 1):
-                    if max(abs(dx), abs(dy)) != radius:
-                        continue
-                    candidates.append((cx + dx, cy + dy))
-        for x, y in candidates:
-            if self.can_place(x, y, w, h):
-                return x, y
+        max_r = max(self.pane_w, self.pane_h)
+        if self.can_place(cx, cy, w, h):
+            return cx, cy
+        for radius in range(1, max_r):
+            for dx in range(-radius, radius + 1):
+                for y in (cy - radius, cy + radius):
+                    if self.can_place(cx + dx, y, w, h):
+                        return cx + dx, y
+            for dy in range(-radius + 1, radius):
+                for x in (cx - radius, cx + radius):
+                    if self.can_place(x, cy + dy, w, h):
+                        return x, cy + dy
         return None
 
     def _pick_next_state(self) -> None:
