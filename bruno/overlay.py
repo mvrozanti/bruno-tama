@@ -440,8 +440,13 @@ def run(args) -> int:
     # If shell bytes arrived very recently, an os.read boundary may have
     # split an escape sequence; injecting our SAVE_CUR / cursor-move into
     # the middle of that sequence corrupts the terminal. Wait for the
-    # stream to settle before overlaying.
-    shell_settle_s = 0.04
+    # stream to settle before overlaying. The pyte parser sees the same
+    # bytes the terminal does — if pyte is mid-sequence, so is the
+    # terminal — so its `_taking_plain_text` flag is a more authoritative
+    # gate than the time window. Keep the time window as a backstop for
+    # cases where pyte's state doesn't reflect the wire (e.g., charset
+    # selection bytes that pyte handles but terminal hasn't yet).
+    shell_settle_s = 0.06
     last_shell_byte = 0.0
 
     try:
@@ -526,8 +531,13 @@ def run(args) -> int:
                     next_tick = now + tick_interval
                 # Skip the overlay this tick if the shell just wrote — the
                 # last byte may be the head of an unterminated escape and
-                # our SAVE_CUR would get parsed as its parameters.
+                # our SAVE_CUR would get parsed as its parameters. The
+                # _taking_plain_text flag is pyte's view of parser state
+                # for the bytes we've forwarded; if it's not True, the
+                # terminal is mid-sequence too.
                 if now - last_shell_byte < shell_settle_s:
+                    continue
+                if getattr(stream, "_taking_plain_text", True) is not True:
                     continue
                 _rebuild_occupancy()
                 bruno.tick_once()
