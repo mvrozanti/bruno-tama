@@ -40,10 +40,13 @@ HIDE_CURSOR = ESC + "[?25l"
 
 TICK_HZ = 10
 SPEECH_CHANCE_PER_TICK = 0.005
-# Skip pyte parsing for reads bigger than this. Anything chunky enough
-# to exceed it is almost certainly a graphics-protocol APC blob, not
-# cell content worth tracking.
-PYTE_FEED_MAX = 16384
+# Skip pyte parsing for reads bigger than this. Yazi/icat graphics
+# blobs run ~130 KB+ for a typical preview; full-screen TUI redraws
+# (claude, htop, lazygit) fit under ~64 KB. The threshold sits in
+# between so we still parse cell-level updates from TUIs — without
+# that, bruno's occupancy view goes stale and he walks over UI cells
+# the host then repaints, leaving visible trails.
+PYTE_FEED_MAX = 65536
 
 
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
