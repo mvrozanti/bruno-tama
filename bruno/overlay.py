@@ -526,25 +526,22 @@ def run(args) -> int:
                     if not more:
                         break
                     data += more
-                # Forward to the real terminal first — pyte parsing is
-                # the slow path and kitty graphics protocol blobs (yazi
-                # image previews, icat transfers) can be megabytes of
-                # base64 inside one APC, which Python-level pyte feed
-                # chews through at ~1 MB/s and blocks the loop.
+                # Big writes are almost certainly graphics-protocol blobs
+                # (yazi previews, icat). pyte parses them at ~1 MB/s and
+                # would block the loop. They also typically scroll the
+                # terminal — and skipping pyte means scroll_delta never
+                # fires, so handle_scroll() can't shift bruno's tracked
+                # cells. Wipe bruno from the terminal *before* the data
+                # is mirrored so his glyphs don't ride the scroll up as
+                # untrackable trails.
+                if len(data) > PYTE_FEED_MAX:
+                    compositor.clear()
                 try:
                     os.write(sys.stdout.fileno(), data)
                 except OSError:
                     pass
                 if len(data) <= PYTE_FEED_MAX:
                     stream.feed(data)
-                else:
-                    # Big write — almost certainly a graphics/image blob,
-                    # not cell content bruno needs to track. Skip pyte to
-                    # keep the loop responsive; the settle window already
-                    # prevents drawing while the stream is hot, so bruno's
-                    # cell view going briefly stale doesn't cause visible
-                    # corruption.
-                    pass
                 activity_idle_ticks = 0
                 last_shell_byte = time.monotonic()
 
