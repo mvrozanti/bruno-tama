@@ -405,11 +405,22 @@ def run(args) -> int:
     compositor = Compositor(sys.stdout.fileno(), screen, debug=debug_log)
 
     resize_pending = [False]
+    # SIGUSR1 toggles bruno-visible without unwrapping the shell. Lets a
+    # tmux key send `kill -USR1 <pane_pid>` to make him vanish/return on
+    # demand. Default disposition for SIGUSR1 is term, so we install the
+    # handler before anything else can race a signal.
+    hidden = [False]
+    hide_pending = [False]
 
     def on_winch(_signum, _frame):
         resize_pending[0] = True
 
+    def on_usr1(_signum, _frame):
+        hidden[0] = not hidden[0]
+        hide_pending[0] = hidden[0]
+
     signal.signal(signal.SIGWINCH, on_winch)
+    signal.signal(signal.SIGUSR1, on_usr1)
 
     old_attrs = None
     if sys.stdin.isatty():
@@ -538,6 +549,11 @@ def run(args) -> int:
                 if now - last_shell_byte < shell_settle_s:
                     continue
                 if getattr(stream, "_taking_plain_text", True) is not True:
+                    continue
+                if hide_pending[0]:
+                    compositor.clear()
+                    hide_pending[0] = False
+                if hidden[0]:
                     continue
                 _rebuild_occupancy()
                 bruno.tick_once()
