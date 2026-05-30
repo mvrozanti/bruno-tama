@@ -225,9 +225,14 @@ class Compositor:
 
         out.append(RESET_SGR + RESTORE_CUR)
         if self._debug:
+            stale_paint = {
+                (r, c): repr(_cell_paint(self.screen, c, r))
+                for r, c in sorted(stale)
+            }
             self._debug.write(
-                f"render: new={sorted(new_cells)} stale={sorted(stale)} "
-                f"bruno_xy=({x},{y})\n"
+                f"render: pyte={self.screen.columns}x{self.screen.lines} "
+                f"new={sorted(new_cells)} stale={sorted(stale)} "
+                f"stale_paint={stale_paint} bruno_xy=({x},{y})\n"
             )
         # Don't re-show cursor here — the user's shell controls visibility.
         os.write(self.stdout_fd, "".join(out).encode("utf-8", errors="replace"))
