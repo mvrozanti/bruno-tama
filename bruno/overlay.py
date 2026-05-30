@@ -40,6 +40,10 @@ HIDE_CURSOR = ESC + "[?25l"
 
 TICK_HZ = 10
 SPEECH_CHANCE_PER_TICK = 0.005
+# Skip pyte parsing for reads bigger than this. Anything chunky enough
+# to exceed it is almost certainly a graphics-protocol APC blob, not
+# cell content worth tracking.
+PYTE_FEED_MAX = 16384
 
 
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
@@ -522,10 +526,24 @@ def run(args) -> int:
                     if not more:
                         break
                     data += more
-                stream.feed(data)
+                # Forward to the real terminal first — pyte parsing is
+                # the slow path and kitty graphics protocol blobs (yazi
+                # image previews, icat transfers) can be megabytes of
+                # base64 inside one APC, which Python-level pyte feed
+                # chews through at ~1 MB/s and blocks the loop.
                 try:
                     os.write(sys.stdout.fileno(), data)
                 except OSError:
+                    pass
+                if len(data) <= PYTE_FEED_MAX:
+                    stream.feed(data)
+                else:
+                    # Big write — almost certainly a graphics/image blob,
+                    # not cell content bruno needs to track. Skip pyte to
+                    # keep the loop responsive; the settle window already
+                    # prevents drawing while the stream is hot, so bruno's
+                    # cell view going briefly stale doesn't cause visible
+                    # corruption.
                     pass
                 activity_idle_ticks = 0
                 last_shell_byte = time.monotonic()
