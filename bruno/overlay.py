@@ -478,12 +478,16 @@ def run(args) -> int:
                 resize_pending[0] = False
                 new_cols, new_rows = _term_size()
                 if (new_cols, new_rows) != (cols, rows):
+                    # Paint pyte content over bruno's current cells BEFORE
+                    # resizing — once screen.resize runs the (row,col)
+                    # coordinates may be out of bounds and we'd leak
+                    # bruno's old glyphs as trails on the new layout.
+                    compositor.clear()
                     cols, rows = new_cols, new_rows
                     _set_winsize(master_fd, rows, cols)
                     screen.resize(rows, cols)
                     bruno.resize(cols, rows)
-                    compositor._last_cells.clear()
-                    compositor._last_bubble_cells.clear()
+                    # last_cells already cleared by compositor.clear() above
 
             if sys.stdin.fileno() in r:
                 try:
