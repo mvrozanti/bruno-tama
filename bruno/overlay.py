@@ -132,8 +132,12 @@ def _cell_paint(screen: pyte.Screen, x: int, y: int) -> str:
         parts.append("1")
     if cell.italics:
         parts.append("3")
-    if cell.underscore:
-        parts.append("4")
+    # Deliberately skip underscore here. Many TUIs (claude, mc, others)
+    # paint a single underlined-space header bar; bruno walking across
+    # those cells looks like he leaves an underscore trail when we
+    # "restore" the SGR on each cell he vacates. The host app will
+    # repaint the underline on its own refresh; dropping it here trades
+    # a momentarily-broken header for the disappearance of bruno trails.
     if cell.blink:
         parts.append("5")
     if cell.reverse:
