@@ -317,28 +317,19 @@ def _bubble_position(bruno_x: int, bruno_y: int, bruno_w: int,
     return None
 
 
-_ALT_SCREEN_MODES = {47, 1047, 1049}
-
-
 class _ScrollTrackingScreen(pyte.Screen):
-    """Pyte screen that records vertical scroll deltas and alt-screen state.
+    """Pyte screen that records vertical scroll deltas.
 
-    Scroll tracking: when the shell prints past the bottom row, the real
-    terminal scrolls too — so any cells we drew at row Y are now visually
-    at row Y - delta. The overlay loop reads this counter to shift its
-    old-cell tracking, then resets it. Without this, bruno's previous
-    frames leave ghost copies on rows that scrolled up.
-
-    Alt-screen tracking: full-screen TUIs (vim, less, htop, gemini-cli,
-    yazi, etc.) enter the alternate-screen buffer via DECSET 1049/1047/47.
-    While in alt-screen, bruno must not paint — the overlay would trample
-    the TUI and the TUI's redraws would leave bruno's glyphs as garbage.
+    When the shell prints past the bottom row, the real terminal scrolls
+    too — so any cells we drew at row Y are now visually at row Y - delta.
+    The overlay loop reads this counter to shift its old-cell tracking,
+    then resets it. Without this, bruno's previous frames leave ghost copies
+    on rows that scrolled up.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.scroll_delta = 0
-        self.alt_screen = False
 
     def index(self):
         if self.cursor.y == self.margins.bottom if self.margins else self.lines - 1:
@@ -350,15 +341,61 @@ class _ScrollTrackingScreen(pyte.Screen):
             self.scroll_delta -= 1
         super().reverse_index()
 
-    def set_mode(self, *modes, **kwargs):
-        if kwargs.get("private") and any(m in _ALT_SCREEN_MODES for m in modes):
-            self.alt_screen = True
-        super().set_mode(*modes, **kwargs)
 
-    def reset_mode(self, *modes, **kwargs):
-        if kwargs.get("private") and any(m in _ALT_SCREEN_MODES for m in modes):
-            self.alt_screen = False
-        super().reset_mode(*modes, **kwargs)
+_DEFAULT_PASSTHROUGH_NAMES = ("gemini", "qwen")
+
+
+def _passthrough_names() -> tuple[str, ...]:
+    raw = os.environ.get("BRUNO_PASSTHROUGH")
+    if raw is None:
+        return _DEFAULT_PASSTHROUGH_NAMES
+    return tuple(n for n in raw.split(",") if n)
+
+
+def _has_passthrough_descendant(root_pid: int, names: tuple[str, ...]) -> bool:
+    """True if any descendant of root_pid has comm matching `names`.
+
+    Walks /proc/<pid>/task/*/children, depth-first, bounded to keep the
+    per-tick cost negligible. Used to suppress sprite rendering for
+    specific TUIs (gemini-cli, qwen) whose redraw pattern collides with
+    bruno's overlay. Other alt-screen TUIs (vim, htop, claude, less)
+    have always tolerated the overlap, so the default keeps bruno
+    visible there.
+    """
+    if not names:
+        return False
+    stack = [root_pid]
+    seen: set[int] = set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        if len(seen) > 64:
+            return False
+        try:
+            with open(f"/proc/{pid}/comm", "rb") as f:
+                comm = f.read().strip().decode("utf-8", "replace")
+        except OSError:
+            continue
+        if comm in names:
+            return True
+        try:
+            entries = os.listdir(f"/proc/{pid}/task")
+        except OSError:
+            continue
+        for tid in entries:
+            try:
+                with open(f"/proc/{pid}/task/{tid}/children", "rb") as f:
+                    raw = f.read().decode("ascii", "replace").split()
+            except OSError:
+                continue
+            for c in raw:
+                try:
+                    stack.append(int(c))
+                except ValueError:
+                    pass
+    return False
 
 
 def run(args) -> int:
@@ -495,7 +532,11 @@ def run(args) -> int:
     shell_settle_s = 0.06
     last_shell_byte = 0.0
     tracked_cwd: str | None = None
-    last_alt_screen = False
+    passthrough_names = _passthrough_names()
+    passthrough_active = False
+    last_passthrough = False
+    passthrough_check_interval = 0.5
+    passthrough_next_check = 0.0
 
     try:
         while True:
@@ -614,20 +655,25 @@ def run(args) -> int:
                     hide_pending[0] = False
                 if hidden[0]:
                     continue
-                # Full-screen TUIs (gemini-cli, vim, htop, yazi, less) enter
-                # the alternate-screen buffer. While they own the screen we
-                # must not paint anything — drawing the sprite would land
-                # inside the TUI's render area, and the TUI's next redraw
-                # would leave bruno glyphs behind as garbage. Erase any
-                # currently drawn bruno cells on the transition into
-                # alt-screen, then no-op every tick until the TUI exits
-                # alt-screen.
-                if screen.alt_screen:
-                    if not last_alt_screen:
+                # A small whitelist of TUIs (default: gemini, qwen) needs
+                # bruno to step aside entirely while they're running —
+                # their redraw pattern collides with the overlay and
+                # leaves bruno glyphs as garbage on every refresh. Other
+                # TUIs (vim, htop, claude, less) have always tolerated
+                # the overlap, so we keep the sprite visible there.
+                # Configurable via BRUNO_PASSTHROUGH=name1,name2 (or empty
+                # string to disable entirely).
+                if now >= passthrough_next_check:
+                    passthrough_next_check = now + passthrough_check_interval
+                    passthrough_active = _has_passthrough_descendant(
+                        pid, passthrough_names
+                    )
+                if passthrough_active:
+                    if not last_passthrough:
                         compositor.clear()
-                        last_alt_screen = True
+                        last_passthrough = True
                     continue
-                last_alt_screen = False
+                last_passthrough = False
                 _rebuild_occupancy()
                 bruno.tick_once()
                 activity_idle_ticks += 1
