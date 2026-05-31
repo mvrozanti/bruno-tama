@@ -317,19 +317,28 @@ def _bubble_position(bruno_x: int, bruno_y: int, bruno_w: int,
     return None
 
 
-class _ScrollTrackingScreen(pyte.Screen):
-    """Pyte screen that records vertical scroll deltas.
+_ALT_SCREEN_MODES = {47, 1047, 1049}
 
-    When the shell prints past the bottom row, the real terminal scrolls
-    too — so any cells we drew at row Y are now visually at row Y - delta.
-    The overlay loop reads this counter to shift its old-cell tracking,
-    then resets it. Without this, bruno's previous frames leave ghost copies
-    on rows that scrolled up.
+
+class _ScrollTrackingScreen(pyte.Screen):
+    """Pyte screen that records vertical scroll deltas and alt-screen state.
+
+    Scroll tracking: when the shell prints past the bottom row, the real
+    terminal scrolls too — so any cells we drew at row Y are now visually
+    at row Y - delta. The overlay loop reads this counter to shift its
+    old-cell tracking, then resets it. Without this, bruno's previous
+    frames leave ghost copies on rows that scrolled up.
+
+    Alt-screen tracking: full-screen TUIs (vim, less, htop, gemini-cli,
+    yazi, etc.) enter the alternate-screen buffer via DECSET 1049/1047/47.
+    While in alt-screen, bruno must not paint — the overlay would trample
+    the TUI and the TUI's redraws would leave bruno's glyphs as garbage.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.scroll_delta = 0
+        self.alt_screen = False
 
     def index(self):
         if self.cursor.y == self.margins.bottom if self.margins else self.lines - 1:
@@ -340,6 +349,16 @@ class _ScrollTrackingScreen(pyte.Screen):
         if self.cursor.y == (self.margins.top if self.margins else 0):
             self.scroll_delta -= 1
         super().reverse_index()
+
+    def set_mode(self, *modes, **kwargs):
+        if kwargs.get("private") and any(m in _ALT_SCREEN_MODES for m in modes):
+            self.alt_screen = True
+        super().set_mode(*modes, **kwargs)
+
+    def reset_mode(self, *modes, **kwargs):
+        if kwargs.get("private") and any(m in _ALT_SCREEN_MODES for m in modes):
+            self.alt_screen = False
+        super().reset_mode(*modes, **kwargs)
 
 
 def run(args) -> int:
@@ -476,6 +495,7 @@ def run(args) -> int:
     shell_settle_s = 0.06
     last_shell_byte = 0.0
     tracked_cwd: str | None = None
+    last_alt_screen = False
 
     try:
         while True:
@@ -594,6 +614,20 @@ def run(args) -> int:
                     hide_pending[0] = False
                 if hidden[0]:
                     continue
+                # Full-screen TUIs (gemini-cli, vim, htop, yazi, less) enter
+                # the alternate-screen buffer. While they own the screen we
+                # must not paint anything — drawing the sprite would land
+                # inside the TUI's render area, and the TUI's next redraw
+                # would leave bruno glyphs behind as garbage. Erase any
+                # currently drawn bruno cells on the transition into
+                # alt-screen, then no-op every tick until the TUI exits
+                # alt-screen.
+                if screen.alt_screen:
+                    if not last_alt_screen:
+                        compositor.clear()
+                        last_alt_screen = True
+                    continue
+                last_alt_screen = False
                 _rebuild_occupancy()
                 bruno.tick_once()
                 activity_idle_ticks += 1
