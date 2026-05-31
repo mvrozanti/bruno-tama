@@ -475,6 +475,7 @@ def run(args) -> int:
     # selection bytes that pyte handles but terminal hasn't yet).
     shell_settle_s = 0.06
     last_shell_byte = 0.0
+    tracked_cwd: str | None = None
 
     try:
         while True:
@@ -571,6 +572,13 @@ def run(args) -> int:
                 next_tick += tick_interval
                 if next_tick < now:
                     next_tick = now + tick_interval
+                try:
+                    child_cwd = os.readlink(f"/proc/{pid}/cwd")
+                    if child_cwd != tracked_cwd:
+                        os.chdir(child_cwd)
+                        tracked_cwd = child_cwd
+                except OSError:
+                    pass
                 # Skip the overlay this tick if the shell just wrote — the
                 # last byte may be the head of an unterminated escape and
                 # our SAVE_CUR would get parsed as its parameters. The
