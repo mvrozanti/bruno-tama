@@ -55,18 +55,18 @@ HAPPY = [
     ["╭───╮", "│^‿^│", "╰───╯"],
 ]
 
-# Squish frames are 4 wide (squash stage) and 3 wide (full smush).
-# Dimensions intentionally vary so impact reads visually.
-SQUISH_R = [
+# Squish dimensions intentionally vary so impact reads visually.
+# Horizontal: 5→4→3 cols wide. Vertical: 3→2 rows tall.
+SQUISH_H = [
     ["╭──╮", "│◕◕│", "╰──╯"],
     ["╭─╮", "│◉│", "╰─╯"],
     ["╭──╮", "│◕◕│", "╰──╯"],
 ]
 
-SQUISH_L = [
-    ["╭──╮", "│◕◕│", "╰──╯"],
-    ["╭─╮", "│◉│", "╰─╯"],
-    ["╭──╮", "│◕◕│", "╰──╯"],
+SQUISH_V = [
+    ["╭───╮", "│◉‿◉│", "╰───╯"],
+    ["╭───╮", "╰─◉─╯"],
+    ["╭───╮", "│◉‿◉│", "╰───╯"],
 ]
 
 POP = [

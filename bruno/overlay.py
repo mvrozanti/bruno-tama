@@ -471,8 +471,18 @@ def run(args) -> int:
         return True
 
     bruno = Bruno(cols, rows, dev_mode=args.dev, can_place=_can_place)
-    bruno.x = max(0, cols - 8)
-    bruno.y = max(0, rows // 2 - 1)
+    # Spawn in open space rather than against the right edge so the
+    # random walk has room in every direction from the start.
+    _initial_frame = bruno.current_frame()
+    _fw, _fh = _initial_frame.width, _initial_frame.height
+    _spawn = bruno.find_clear_spot(_fw, _fh,
+                                   near_x=max(0, cols // 2 - _fw // 2),
+                                   near_y=max(0, rows // 2 - _fh // 2))
+    if _spawn is not None:
+        bruno.x, bruno.y = _spawn
+    else:
+        bruno.x = max(0, cols - 8)
+        bruno.y = max(0, rows // 2 - 1)
 
     compositor = Compositor(sys.stdout.fileno(), screen, debug=debug_log)
 

@@ -68,6 +68,9 @@ class Bruno:
         self.mood = 60       # 0..100
 
         self.bumped = False
+        # "h" or "v" — which axis the next SQUISH animation pulses on.
+        # Set just before entering SQUISH based on impact direction.
+        self.squish_axis = "h"
 
         self.speech = None
         self.speech_ticks = 0
@@ -99,7 +102,7 @@ class Bruno:
         if self.state == HAPPY:
             return sprites.HAPPY
         if self.state == SQUISH:
-            return sprites.SQUISH_R if self._last_facing > 0 else sprites.SQUISH_L
+            return sprites.SQUISH_V if self.squish_axis == "v" else sprites.SQUISH_H
         if self.state == LOOK:
             return sprites.LOOK_R if self.facing > 0 else sprites.LOOK_L
         if self.state == WALK:
@@ -166,9 +169,28 @@ class Bruno:
         if self.state_ticks <= 0 and self.state != SQUISH:
             self._pick_next_state()
 
+    def _free_run(self, dx: int, dy: int, f: Frame, cap: int) -> int:
+        """How many steps of (dx, dy) bruno can take before something blocks.
+        Used to bias direction picking toward open space."""
+        steps = 0
+        x, y = self.x, self.y
+        for _ in range(cap):
+            x += dx
+            y += dy
+            if not self.can_place(x, y, f.width, f.height):
+                break
+            steps += 1
+        return steps
+
     def _pick_walk_direction(self) -> None:
-        """Pick one of the four cardinal directions for the next walk."""
-        self.dx, self.dy = random.choice([(1, 0), (-1, 0), (0, 1), (0, -1)])
+        """Pick a cardinal direction, weighted by how much open space lies
+        that way. Heavily blocked directions stay possible (weight +1) so
+        cramped panes don't deadlock the picker."""
+        f = self.current_frame()
+        cap = max(self.pane_w, self.pane_h)
+        dirs = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        weights = [self._free_run(dx, dy, f, cap) + 1 for dx, dy in dirs]
+        (self.dx, self.dy) = random.choices(dirs, weights=weights, k=1)[0]
         if self.dx != 0:
             self._last_facing = 1 if self.dx > 0 else -1
 
@@ -177,10 +199,21 @@ class Bruno:
         if self.tick % 2 == 0:
             new_x = self.x + self.dx
             new_y = self.y + self.dy
+            out_of_bounds = (
+                new_x < 0 or new_y < 0
+                or new_x + f.width > self.pane_w
+                or new_y + f.height > self.pane_h
+            )
+            if out_of_bounds:
+                # Hit a pane edge, not an obstacle — turn around, no squish.
+                self._pick_walk_direction()
+                return
             if not self.can_place(new_x, new_y, f.width, f.height):
-                # Remember which way we were facing for the squish sprite.
+                # In-bounds rejection = shell content. Squish axis follows
+                # impact direction.
                 if self.dx != 0:
                     self._last_facing = 1 if self.dx > 0 else -1
+                self.squish_axis = "v" if self.dy != 0 else "h"
                 self._enter(SQUISH, 8)
                 return
             self.x = new_x
