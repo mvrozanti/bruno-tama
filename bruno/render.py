@@ -67,7 +67,8 @@ class Painter:
         self._last_cells: set[tuple[int, int]] = set()
 
     def paint(self, sprite_lines: list[str], x: int, y: int,
-              bubble_lines: list[str] | None, bx: int, by: int) -> None:
+              bubble_lines: list[str] | None, bx: int, by: int,
+              extra_cells: list[tuple[int, int, str, str | None]] | None = None) -> None:
         new_cells: set[tuple[int, int]] = set()
         out: list[str] = []
 
@@ -90,6 +91,18 @@ class Painter:
                         continue
                     new_cells.add((row, col))
                     out.append(_move_to(row + 1, col + 1) + DIM + ch + RESET)
+
+        if extra_cells:
+            for row, col, ch, sgr in extra_cells:
+                if ch == " ":
+                    continue
+                if (row, col) in new_cells:
+                    continue
+                new_cells.add((row, col))
+                if sgr:
+                    out.append(_move_to(row + 1, col + 1) + sgr + ch + RESET)
+                else:
+                    out.append(_move_to(row + 1, col + 1) + ch)
 
         # Erase cells from last frame that aren't in this frame
         stale = self._last_cells - new_cells

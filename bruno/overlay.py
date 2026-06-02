@@ -16,6 +16,7 @@ import fcntl
 import os
 import pty
 import pwd
+import re
 import select
 import shutil
 import signal
@@ -27,7 +28,8 @@ import tty
 
 import pyte
 
-from . import say
+from . import llm as llm_mod
+from . import say, shellhook, state, tmux
 from .creature import Bruno
 
 ESC = "\x1b"
@@ -135,12 +137,13 @@ def _cell_paint(screen: pyte.Screen, x: int, y: int) -> str:
         parts.append("1")
     if cell.italics:
         parts.append("3")
-    # Deliberately skip underscore here. Many TUIs (claude, mc, others)
-    # paint a single underlined-space header bar; bruno walking across
-    # those cells looks like he leaves an underscore trail when we
-    # "restore" the SGR on each cell he vacates. The host app will
-    # repaint the underline on its own refresh; dropping it here trades
-    # a momentarily-broken header for the disappearance of bruno trails.
+    # Restore underline only on non-blank cells. Underlined spaces (TUI
+    # header bars in claude, mc, etc.) render as visible underscore
+    # trails when bruno vacates; underlined real characters render
+    # correctly and matter for the user's content (markdown headers,
+    # mc highlights). Gate on cell.data.
+    if cell.underscore and ch != " ":
+        parts.append("4")
     if cell.blink:
         parts.append("5")
     if cell.reverse:
@@ -181,12 +184,15 @@ class Compositor:
         self.screen = screen
         self._last_cells: set[tuple[int, int]] = set()
         self._last_bubble_cells: set[tuple[int, int]] = set()
+        self._last_particle_cells: set[tuple[int, int]] = set()
         self._debug = debug
 
     def render(self, sprite_lines: list[str], x: int, y: int,
-               bubble_lines: list[str] | None, bx: int, by: int) -> None:
+               bubble_lines: list[str] | None, bx: int, by: int,
+               particle_cells: list[tuple[int, int, str, str | None]] | None = None) -> None:
         new_cells: set[tuple[int, int]] = set()
         new_bubble_cells: set[tuple[int, int]] = set()
+        new_particle_cells: set[tuple[int, int]] = set()
         # Don't HIDE_CURSOR here — it has no paired SHOW, so the cursor
         # stays invisible across long-running shell output. A 1-frame
         # cursor flicker on bruno's cell is invisible; a permanently
@@ -220,12 +226,26 @@ class Compositor:
                     new_bubble_cells.add((row, col))
                     out.append(_move_to(row, col) + DIM_SGR + ch + RESET_SGR)
 
+        if particle_cells:
+            for row, col, ch, sgr in particle_cells:
+                if ch == " ":
+                    continue
+                if row < 0 or row >= self.screen.lines:
+                    continue
+                if col < 0 or col >= self.screen.columns:
+                    continue
+                if (row, col) in new_cells or (row, col) in new_bubble_cells:
+                    continue
+                new_particle_cells.add((row, col))
+                prefix = sgr if sgr else ""
+                out.append(_move_to(row, col) + prefix + ch + RESET_SGR)
+
         # Restore cells we owned last tick that we don't own this tick.
         # Use whatever pyte reports for the underlying shell content,
         # including its SGR state — otherwise we strip the prompt's
         # colors when bruno walks off them.
-        all_old = self._last_cells | self._last_bubble_cells
-        all_new = new_cells | new_bubble_cells
+        all_old = self._last_cells | self._last_bubble_cells | self._last_particle_cells
+        all_new = new_cells | new_bubble_cells | new_particle_cells
         stale = all_old - all_new
         for row, col in stale:
             out.append(_move_to(row, col) + _cell_paint(self.screen, col, row))
@@ -245,9 +265,10 @@ class Compositor:
         os.write(self.stdout_fd, "".join(out).encode("utf-8", errors="replace"))
         self._last_cells = new_cells
         self._last_bubble_cells = new_bubble_cells
+        self._last_particle_cells = new_particle_cells
 
     def clear(self) -> None:
-        all_old = self._last_cells | self._last_bubble_cells
+        all_old = self._last_cells | self._last_bubble_cells | self._last_particle_cells
         if not all_old:
             return
         out = [SAVE_CUR]
@@ -260,9 +281,10 @@ class Compositor:
             pass
         self._last_cells.clear()
         self._last_bubble_cells.clear()
+        self._last_particle_cells.clear()
 
     def handle_scroll(self, delta: int, rows: int) -> None:
-        all_old = self._last_cells | self._last_bubble_cells
+        all_old = self._last_cells | self._last_bubble_cells | self._last_particle_cells
         if not all_old:
             return
         out = [SAVE_CUR]
@@ -281,6 +303,7 @@ class Compositor:
                 pass
         self._last_cells.clear()
         self._last_bubble_cells.clear()
+        self._last_particle_cells.clear()
 
 
 def _bubble_position(bruno_x: int, bruno_y: int, bruno_w: int,
@@ -344,6 +367,50 @@ class _ScrollTrackingScreen(pyte.Screen):
 
 _DEFAULT_PASSTHROUGH_NAMES = ("gemini", "qwen")
 
+# Patterns that the pyte fallback scanner matches against newly-appearing
+# screen lines. Used when the shell precmd hook is unavailable (different
+# shell, BASH_ENV blocked, FIFO mkfifo failed).
+_PYTE_COMMIT_RE = re.compile(r"^\s*\[[\w\-/]+\s+[0-9a-f]{7,}\]")
+_PYTE_NEW_BRANCH_RE = re.compile(r"Switched to a new branch '([^']+)'")
+_PYTE_PUSH_RE = re.compile(r"\bTo\s+(?:https?|git|ssh|\S+):.+")
+
+
+class PyteScanner:
+    """Scan pyte-rendered shell output for Phase 2 fallback signals.
+
+    The shell hook catches everything precisely; this scanner exists only
+    so users on shells we don't hook into still get some reactions.
+    """
+
+    def __init__(self):
+        self._prev: list[str] = []
+
+    def scan(self, screen) -> list[tuple[str, tuple]]:
+        cur = list(screen.display)
+        emitted: list[tuple[str, tuple]] = []
+        # Compare line-by-line. When rows shrink (rare), reset.
+        if len(cur) != len(self._prev):
+            self._prev = cur
+            return emitted
+        for i, line in enumerate(cur):
+            if i >= len(self._prev) or line == self._prev[i]:
+                continue
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if _PYTE_COMMIT_RE.match(stripped):
+                emitted.append(("react_commit", ()))
+                continue
+            m = _PYTE_NEW_BRANCH_RE.search(stripped)
+            if m:
+                emitted.append(("react_branch", (m.group(1),)))
+                continue
+            if _PYTE_PUSH_RE.search(stripped):
+                emitted.append(("react_push", ()))
+                continue
+        self._prev = cur
+        return emitted
+
 
 def _passthrough_names() -> tuple[str, ...]:
     raw = os.environ.get("BRUNO_PASSTHROUGH")
@@ -398,24 +465,92 @@ def _has_passthrough_descendant(root_pid: int, names: tuple[str, ...]) -> bool:
     return False
 
 
+def _resolve_llm_backend(args, persisted: dict) -> str:
+    """Pick the active LLM backend for this run.
+
+    CLI flag wins. Otherwise persisted choice. Otherwise "none" (first run
+    is off by default; user gets a one-shot hint in-pane).
+    """
+    cli = getattr(args, "llm", None)
+    if cli in ("none", "qwen", "gemini"):
+        return cli
+    if cli == "auto":
+        probe = llm_mod.probe_backends()
+        if probe.qwen_available:
+            return "qwen"
+        if probe.gemini_available:
+            return "gemini"
+        return "none"
+    persisted_val = persisted.get("llm_backend")
+    if persisted_val in ("none", "qwen", "gemini"):
+        return persisted_val
+    return "none"
+
+
+def _maybe_show_first_run_hint(bruno: Bruno, args, persisted: dict,
+                               active_backend: str) -> None:
+    """One-shot hint about LLM availability on the very first run.
+
+    Probes silently and emits a single speech bubble naming what's
+    available + how to opt in. Persists `llm_prompted_on` so it never
+    fires again.
+    """
+    if persisted.get("llm_prompted_on"):
+        return
+    if active_backend != "none":
+        persisted["llm_prompted_on"] = time.time()
+        return
+    if getattr(args, "llm", None) is not None:
+        # user already engaged with the flag; no need to nag.
+        persisted["llm_prompted_on"] = time.time()
+        return
+    probe = llm_mod.probe_backends()
+    opts = probe.options()
+    persisted["llm_prompted_on"] = time.time()
+    if not opts:
+        return
+    hint = "llm? --llm " + "/".join(opts)
+    bruno.say(hint, ticks=80)
+
+
 def run(args) -> int:
     """Spawn a shell with bruno overlaid. Returns the shell's exit code."""
     cols, rows = _term_size()
 
+    # Pick shell up-front so the parent can install the precmd hook against
+    # the right rc snippet before forking. Same selection logic as the
+    # child branch below.
+    try:
+        entry = pwd.getpwuid(os.getuid())
+        chosen_shell = entry.pw_shell if entry.pw_shell and os.path.exists(entry.pw_shell) \
+            else os.environ.get("SHELL", "/bin/bash")
+    except Exception:
+        chosen_shell = os.environ.get("SHELL", "/bin/bash")
+
+    hook_install = None
+    if not getattr(args, "no_shell_hook", False):
+        try:
+            hook_install = shellhook.install(chosen_shell)
+        except Exception:
+            hook_install = None
+        if hook_install is None:
+            try:
+                state.log_once(
+                    f"shell-hook install failed for {chosen_shell}; "
+                    "Phase 2 will rely on pyte scan only.",
+                    "shellhook-install",
+                )
+            except Exception:
+                pass
+
     pid, master_fd = pty.fork()
     if pid == 0:
-        # Pick the user's real login shell from /etc/passwd, not $SHELL —
-        # `nix develop -c` sets SHELL=/bin/bash which would lose the rice.
-        try:
-            entry = pwd.getpwuid(os.getuid())
-            shell = entry.pw_shell if entry.pw_shell and os.path.exists(entry.pw_shell) \
-                else os.environ.get("SHELL", "/bin/bash")
-        except Exception:
-            shell = os.environ.get("SHELL", "/bin/bash")
-
+        shell = chosen_shell
         env = os.environ.copy()
         env["BRUNO_ACTIVE"] = "1"
         env["SHELL"] = shell
+        if hook_install is not None:
+            env.update(hook_install.env_updates)
 
         # Strip nix-develop/build-shell pollution so the spawned login
         # shell starts from a clean profile and prezto/zshrc don't see
@@ -431,8 +566,18 @@ def run(args) -> int:
         # argv[0] starting with '-' makes bash/zsh/etc. behave as a login
         # shell, sourcing ~/.zprofile (and via that, the full prezto chain).
         shell_name = os.path.basename(shell)
+        bash_rc = env.get("BRUNO_BASH_RC")
+        argv: list[str]
+        if shell_name in ("bash", "sh") and bash_rc:
+            # bash --rcfile loses login-shell semantics, so source the
+            # user's profile chain via the shim itself; we still pass
+            # `-bash` so $0 looks login-ish. The shim already chains
+            # ~/.bashrc before our hook.
+            argv = [f"-{shell_name}", "--rcfile", bash_rc, "-i"]
+        else:
+            argv = [f"-{shell_name}"]
         try:
-            os.execvpe(shell, [f"-{shell_name}"], env)
+            os.execvpe(shell, argv, env)
         except OSError:
             try:
                 os.execvpe(shell, [shell], env)
@@ -470,7 +615,15 @@ def run(args) -> int:
                     return False
         return True
 
-    bruno = Bruno(cols, rows, dev_mode=args.dev, can_place=_can_place)
+    persisted = state.load()
+    bruno = Bruno(cols, rows, dev_mode=args.dev, can_place=_can_place,
+                  persisted=persisted)
+    save_every_ticks = 300
+
+    def _persist():
+        merged = dict(persisted)
+        merged.update(bruno.persist_dict())
+        state.save(merged)
     # Spawn in open space rather than against the right edge so the
     # random walk has room in every direction from the start.
     _initial_frame = bruno.current_frame()
@@ -524,6 +677,40 @@ def run(args) -> int:
                 termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_attrs)
             except Exception:
                 pass
+
+    hook_fd: int | None = None
+    hook_buf = bytearray()
+    if hook_install is not None:
+        hook_fd = shellhook.open_reader(hook_install.fifo_path)
+
+    # Phase 4: IPC feed file. Anyone can `echo "anything" > $XDG_RUNTIME_DIR/bruno_feed`
+    # (or /tmp/bruno_feed) to trigger a feed reaction. PID-agnostic so a
+    # single-user-multi-pane setup wakes every bruno; that's the intent.
+    feed_path = os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
+        "bruno_feed",
+    )
+    feed_fd: int | None = None
+    try:
+        feed_fd = os.open(feed_path, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK, 0o600)
+        os.ftruncate(feed_fd, 0)
+    except OSError:
+        feed_fd = None
+
+    pyte_scanner = PyteScanner()
+    pyte_scan_every = 5  # every ~0.5s @ 10Hz
+
+    # ---- Phase 6: LLM setup ----
+    llm_backend = _resolve_llm_backend(args, persisted)
+    persisted["llm_backend"] = llm_backend
+    reactor: llm_mod.AsyncReactor | None = None
+    if llm_backend not in (None, "none"):
+        reactor = llm_mod.AsyncReactor(llm_backend)
+    llm_interval_s = max(30, int(getattr(args, "llm_interval", 180) or 180))
+    llm_next_call_at = time.monotonic() + 5.0  # short initial delay
+    llm_last_hash = ""
+    _maybe_show_first_run_hint(bruno, args, persisted, llm_backend)
+    _persist()
 
     next_tick = time.monotonic()
     tick_interval = 1.0 / TICK_HZ
@@ -663,7 +850,8 @@ def run(args) -> int:
                 if hide_pending[0]:
                     compositor.clear()
                     hide_pending[0] = False
-                if hidden[0]:
+                if hidden[0] or bruno._hidden:
+                    compositor.clear()
                     continue
                 # A small whitelist of TUIs (default: gemini, qwen) needs
                 # bruno to step aside entirely while they're running —
@@ -687,6 +875,71 @@ def run(args) -> int:
                 _rebuild_occupancy()
                 bruno.tick_once()
                 activity_idle_ticks += 1
+
+                if bruno.tick % save_every_ticks == 0:
+                    _persist()
+
+                if hook_fd is not None:
+                    for event in shellhook.drain_events(hook_fd, hook_buf):
+                        decision = shellhook.interpret(event)
+                        if not decision:
+                            continue
+                        method_name, method_args = decision
+                        # Verbs (hide/show/stats/feed) always fire — they
+                        # are explicit user actions. Reactions fall through
+                        # the speech-busy gate to avoid stomping bubbles.
+                        is_verb = event and event[0] == "verb"
+                        if not is_verb and bruno.speech is not None:
+                            continue
+                        method = getattr(bruno, method_name, None)
+                        if method is None:
+                            continue
+                        try:
+                            method(*method_args)
+                        except Exception:
+                            pass
+
+                if feed_fd is not None and bruno.speech is None:
+                    try:
+                        chunk = os.read(feed_fd, 256)
+                    except (BlockingIOError, OSError):
+                        chunk = b""
+                    if chunk:
+                        try:
+                            os.ftruncate(feed_fd, 0)
+                            os.lseek(feed_fd, 0, os.SEEK_SET)
+                        except OSError:
+                            pass
+                        try:
+                            bruno.feed()
+                        except Exception:
+                            pass
+
+                if bruno.tick % pyte_scan_every == 0 and bruno.speech is None:
+                    for method_name, method_args in pyte_scanner.scan(screen):
+                        method = getattr(bruno, method_name, None)
+                        if method is None:
+                            continue
+                        try:
+                            method(*method_args)
+                        except Exception:
+                            pass
+                        if bruno.speech is not None:
+                            break
+
+                if reactor is not None:
+                    result = reactor.poll()
+                    if result and bruno.speech is None:
+                        bruno.react_llm(result)
+                    if now >= llm_next_call_at and not reactor.is_pending() \
+                            and bruno.speech is None:
+                        snippet = llm_mod.sample_tmux_text() if tmux.in_tmux() else ""
+                        if snippet and len(snippet) >= llm_mod.MIN_NEW_TEXT:
+                            h = llm_mod.text_hash(snippet)
+                            if h != llm_last_hash:
+                                llm_last_hash = h
+                                reactor.request(snippet)
+                        llm_next_call_at = now + llm_interval_s
 
                 # Handle displacement: if bruno's current spot now has content,
                 # try to teleport to a clear spot. Otherwise just hide him.
@@ -715,7 +968,18 @@ def run(args) -> int:
                     if placed is not None:
                         bubble, bx, by = placed
 
-                compositor.render(f.lines, bruno.x, bruno.y, bubble, bx, by)
+                particle_cells: list[tuple[int, int, str, str | None]] = []
+                for row, col, ch, sgr in bruno.particle_cells():
+                    if 0 <= row < rows and 0 <= col < cols \
+                            and _cell_empty(screen, col, row):
+                        particle_cells.append((row, col, ch, sgr))
+                for row, col, ch, sgr in bruno.aura_cells(f.width, f.height):
+                    if 0 <= row < rows and 0 <= col < cols \
+                            and _cell_empty(screen, col, row):
+                        particle_cells.append((row, col, ch, sgr))
+
+                compositor.render(f.lines, bruno.x, bruno.y, bubble, bx, by,
+                                  particle_cells)
 
             # Reap zombie if shell exited without us catching EOF
             try:
@@ -727,6 +991,25 @@ def run(args) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            _persist()
+        except Exception:
+            pass
+        if hook_fd is not None:
+            try:
+                os.close(hook_fd)
+            except OSError:
+                pass
+        if feed_fd is not None:
+            try:
+                os.close(feed_fd)
+            except OSError:
+                pass
+        if hook_install is not None:
+            try:
+                hook_install.cleanup()
+            except Exception:
+                pass
         compositor.clear()
         try:
             os.write(sys.stdout.fileno(), (RESET_SGR + SHOW_CURSOR).encode())

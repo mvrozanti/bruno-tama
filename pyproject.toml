@@ -41,3 +41,6 @@ bruno = "bruno.__main__:main"
 
 [tool.setuptools]
 packages = ["bruno"]
+
+[tool.setuptools.package-data]
+bruno = ["rc/*.bash", "rc/*.zsh"]

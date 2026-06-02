@@ -1,6 +1,7 @@
 """Main loop. Run with: python -m bruno  (or just `bruno` after install)."""
 from __future__ import annotations
 import argparse
+import os
 import random
 import select
 import signal
@@ -10,7 +11,8 @@ import time
 import tty
 from contextlib import contextmanager
 
-from . import render, say, tmux
+from . import llm as llm_mod
+from . import render, say, state, tmux
 from .creature import Bruno, IDLE, WALK, SLEEP, HUNGRY, HAPPY, SQUISH, LOOK
 
 TICK_MS = 100   # 10 fps
@@ -72,6 +74,23 @@ def pick_bubble_position(bruno_x: int, bruno_y: int, bruno_w: int,
     return None
 
 
+def _resolve_llm_backend_pane(args, persisted: dict) -> str:
+    cli = getattr(args, "llm", None)
+    if cli in ("none", "qwen", "gemini"):
+        return cli
+    if cli == "auto":
+        probe = llm_mod.probe_backends()
+        if probe.qwen_available:
+            return "qwen"
+        if probe.gemini_available:
+            return "gemini"
+        return "none"
+    persisted_val = persisted.get("llm_backend")
+    if persisted_val in ("none", "qwen", "gemini"):
+        return persisted_val
+    return "none"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="bruno",
@@ -86,6 +105,15 @@ def main() -> int:
     parser.add_argument("--mode", choices=["overlay", "pane"], default="overlay",
                         help="overlay = wrap your shell and draw on top "
                              "(default); pane = own the whole pane")
+    parser.add_argument("--llm", choices=["none", "qwen", "gemini", "auto"],
+                        default=None,
+                        help="LLM backend for Phase 6 pane-aware reactions. "
+                             "Default: persisted choice, else 'auto' (probe + "
+                             "first-run prompt). Use 'none' for fully offline.")
+    parser.add_argument("--llm-interval", type=int, default=180,
+                        help="seconds between LLM pane samples (default 180)")
+    parser.add_argument("--no-shell-hook", action="store_true",
+                        help="skip injecting the bash/zsh precmd hook")
     args = parser.parse_args()
 
     if args.mode == "overlay":
@@ -95,7 +123,8 @@ def main() -> int:
     tick_seconds = 1.0 / max(1, min(30, args.fps))
 
     pane_w, pane_h = render.term_size()
-    bruno = Bruno(pane_w, pane_h, dev_mode=args.dev)
+    persisted = state.load()
+    bruno = Bruno(pane_w, pane_h, dev_mode=args.dev, persisted=persisted)
     painter = render.Painter()
 
     resize_pending = [False]
@@ -106,6 +135,31 @@ def main() -> int:
     signal.signal(signal.SIGWINCH, on_resize)
 
     use_tmux = (not args.no_tmux) and tmux.in_tmux()
+
+    save_every_ticks = 300
+
+    def _persist():
+        merged = dict(persisted)
+        merged.update(bruno.persist_dict())
+        state.save(merged)
+
+    llm_backend = _resolve_llm_backend_pane(args, persisted)
+    persisted["llm_backend"] = llm_backend
+    reactor = llm_mod.AsyncReactor(llm_backend) if llm_backend not in (None, "none") else None
+    llm_interval_s = max(30, int(getattr(args, "llm_interval", 180) or 180))
+    llm_next_call_at = time.monotonic() + 5.0
+    llm_last_hash = ""
+
+    feed_path = os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
+        "bruno_feed",
+    )
+    feed_fd: int | None = None
+    try:
+        feed_fd = os.open(feed_path, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK, 0o600)
+        os.ftruncate(feed_fd, 0)
+    except OSError:
+        feed_fd = None
 
     with render.screen(), cbreak_stdin() as fd:
         try:
@@ -146,6 +200,9 @@ def main() -> int:
 
                 bruno.tick_once()
 
+                if bruno.tick % save_every_ticks == 0:
+                    _persist()
+
                 # Spontaneous speech
                 if bruno.speech is None and random.random() < SPEECH_CHANCE_PER_TICK:
                     bruno.say(say.pick(bruno.state, dev_mode=args.dev), ticks=50)
@@ -167,23 +224,62 @@ def main() -> int:
                             if signal_word in reactions and bruno.speech is None:
                                 bruno.say(reactions[signal_word], ticks=50)
 
+                if reactor is not None:
+                    result = reactor.poll()
+                    if result and bruno.speech is None:
+                        bruno.react_llm(result)
+                    if time.monotonic() >= llm_next_call_at \
+                            and not reactor.is_pending() \
+                            and bruno.speech is None:
+                        snippet = llm_mod.sample_tmux_text() if use_tmux else ""
+                        if snippet and len(snippet) >= llm_mod.MIN_NEW_TEXT:
+                            h = llm_mod.text_hash(snippet)
+                            if h != llm_last_hash:
+                                llm_last_hash = h
+                                reactor.request(snippet)
+                        llm_next_call_at = time.monotonic() + llm_interval_s
+
+                if feed_fd is not None and bruno.speech is None:
+                    try:
+                        chunk = os.read(feed_fd, 256)
+                    except (BlockingIOError, OSError):
+                        chunk = b""
+                    if chunk:
+                        try:
+                            os.ftruncate(feed_fd, 0)
+                            os.lseek(feed_fd, 0, os.SEEK_SET)
+                        except OSError:
+                            pass
+                        try:
+                            bruno.feed()
+                        except Exception:
+                            pass
+
                 # Compose render
                 f = bruno.current_frame()
                 # Keep bruno inside the pane (he may have shifted form/size)
                 bruno.x = max(0, min(bruno.x, max(0, pane_w - f.width)))
                 bruno.y = max(0, min(bruno.y, max(0, pane_h - f.height)))
 
-                bubble_lines = None
-                bubble_x = bubble_y = 0
-                if bruno.speech:
-                    placed = pick_bubble_position(
-                        bruno.x, bruno.y, f.width, pane_w, pane_h, bruno.speech
-                    )
-                    if placed:
-                        bubble_lines, bubble_x, bubble_y = placed
+                if bruno._hidden:
+                    painter.clear()
+                else:
+                    bubble_lines = None
+                    bubble_x = bubble_y = 0
+                    if bruno.speech:
+                        placed = pick_bubble_position(
+                            bruno.x, bruno.y, f.width, pane_w, pane_h, bruno.speech
+                        )
+                        if placed:
+                            bubble_lines, bubble_x, bubble_y = placed
 
-                painter.paint(f.lines, bruno.x, bruno.y,
-                              bubble_lines, bubble_x, bubble_y)
+                    extra_cells = list(bruno.particle_cells()) + list(
+                        bruno.aura_cells(f.width, f.height)
+                    )
+
+                    painter.paint(f.lines, bruno.x, bruno.y,
+                                  bubble_lines, bubble_x, bubble_y,
+                                  extra_cells=extra_cells)
 
                 next_tick += tick_seconds
                 sleep_for = next_tick - time.monotonic()
@@ -193,6 +289,13 @@ def main() -> int:
                     next_tick = time.monotonic()
         except KeyboardInterrupt:
             return 0
+        finally:
+            _persist()
+            if feed_fd is not None:
+                try:
+                    os.close(feed_fd)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

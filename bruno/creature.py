@@ -7,10 +7,12 @@ Coordinates: (x, y) is the *top-left corner of bruno's bounding box*.
 The bbox is sprite-sized (varies between states/forms).
 """
 from __future__ import annotations
+import datetime
 import random
 import time
 from dataclasses import dataclass
 from . import sprites
+from .particles import ParticleSystem
 
 IDLE = "idle"
 WALK = "walk"
@@ -19,6 +21,13 @@ HUNGRY = "hungry"
 HAPPY = "happy"
 SQUISH = "squish"
 LOOK = "look"
+
+BABY = "baby"
+ADULT = "adult"
+ELDER = "elder"
+
+BABY_MAX_DAYS = 7
+ADULT_MAX_DAYS = 30
 
 
 @dataclass
@@ -36,7 +45,7 @@ class Frame:
 
 class Bruno:
     def __init__(self, pane_w: int, pane_h: int, dev_mode: bool = False,
-                 can_place=None):
+                 can_place=None, persisted: dict | None = None):
         self.pane_w = pane_w
         self.pane_h = pane_h
         self.dev_mode = dev_mode
@@ -63,9 +72,10 @@ class Bruno:
         self.tick = 0
         self.frame_period = 4
 
-        self.hunger = 0      # 0..100, 100 = starving
-        self.energy = 100    # 0..100, 0 = exhausted
-        self.mood = 60       # 0..100
+        p = persisted or {}
+        self.hunger = int(p.get("hunger", 0))
+        self.energy = int(p.get("energy", 100))
+        self.mood = int(p.get("mood", 60))
 
         self.bumped = False
         # "h" or "v" — which axis the next SQUISH animation pulses on.
@@ -76,11 +86,49 @@ class Bruno:
         self.speech_ticks = 0
 
         self.born_at = time.monotonic()
+        # Wall-clock birth survives restart. `born_at` (monotonic) is for
+        # in-process timing only; `born_at_wall` drives age_days / life_stage.
+        try:
+            self.born_at_wall = float(p.get("born_at_wall", time.time()))
+        except (TypeError, ValueError):
+            self.born_at_wall = time.time()
+
+        self.particles = ParticleSystem(pane_w, pane_h)
+        # Set by bruno:hide / bruno:show verb FIFO events. Either renderer
+        # can OR-combine this with its own visibility toggles (e.g. SIGUSR1).
+        self._hidden = False
 
     @property
     def facing(self) -> int:
         # 1 = right, -1 = left. Used by sprite picking only.
         return 1 if self.dx > 0 else (-1 if self.dx < 0 else self._last_facing)
+
+    # ---- age ----
+
+    @property
+    def age_seconds(self) -> float:
+        return max(0.0, time.time() - self.born_at_wall)
+
+    @property
+    def age_days(self) -> float:
+        return self.age_seconds / 86400.0
+
+    @property
+    def life_stage(self) -> str:
+        d = self.age_days
+        if d <= BABY_MAX_DAYS:
+            return BABY
+        if d <= ADULT_MAX_DAYS:
+            return ADULT
+        return ELDER
+
+    def persist_dict(self) -> dict:
+        return {
+            "hunger": self.hunger,
+            "energy": self.energy,
+            "mood": self.mood,
+            "born_at_wall": self.born_at_wall,
+        }
 
     # ---- sprite selection ----
 
@@ -95,23 +143,29 @@ class Bruno:
                 return sprites.MICRO
             return sprites.TINY
 
+        table = sprites.STAGE_SPRITES.get(self.life_stage, sprites.STAGE_SPRITES[BABY])
         if self.state == SLEEP:
-            return sprites.SLEEP
+            return table["SLEEP"]
         if self.state == HUNGRY:
-            return sprites.HUNGRY
+            return table["HUNGRY"]
         if self.state == HAPPY:
-            return sprites.HAPPY
+            return table["HAPPY"]
         if self.state == SQUISH:
-            return sprites.SQUISH_V if self.squish_axis == "v" else sprites.SQUISH_H
+            return table["SQUISH_V"] if self.squish_axis == "v" else table["SQUISH_H"]
         if self.state == LOOK:
-            return sprites.LOOK_R if self.facing > 0 else sprites.LOOK_L
+            return table["LOOK_R"] if self.facing > 0 else table["LOOK_L"]
         if self.state == WALK:
-            return sprites.WALK_R if self.facing > 0 else sprites.WALK_L
-        return sprites.IDLE
+            return table["WALK_R"] if self.facing > 0 else table["WALK_L"]
+        return table["IDLE"]
 
     def current_frame(self) -> Frame:
         s = self._sprite_set()
-        return Frame(lines=list(s[self.frame_idx % len(s)]))
+        lines = list(s[self.frame_idx % len(s)])
+        deco = sprites.decoration_for_today(self.born_at_wall)
+        if deco is not None:
+            sprite_w = max((len(line) for line in lines), default=0)
+            lines = sprites.compose_decoration(lines, deco, sprite_w)
+        return Frame(lines=lines)
 
     # ---- update ----
 
@@ -122,9 +176,16 @@ class Bruno:
         f = self.current_frame()
         self.x = max(0, min(self.x, max(0, pane_w - f.width)))
         self.y = max(0, min(self.y, max(0, pane_h - f.height)))
+        self.particles.resize(pane_w, pane_h)
 
     def tick_once(self) -> None:
         self.tick += 1
+
+        self.particles.tick()
+
+        if self.state == SLEEP and self.tick % 30 == 0:
+            f = self.current_frame()
+            self.particles.spawn_sleep_z(self.x, self.y, f.width)
 
         if self.tick % self.frame_period == 0:
             self.frame_idx += 1
@@ -162,7 +223,9 @@ class Bruno:
                 spot = self.find_clear_spot(f.width, f.height,
                                             near_x=self.x, near_y=self.y)
                 if spot is not None:
+                    old_x, old_y = self.x, self.y
                     self.x, self.y = spot
+                    self.particles.spawn_dust(old_x, old_y, f.width, f.height)
                 self._pick_walk_direction()
                 self._enter(WALK, random.randint(40, 120))
 
@@ -278,6 +341,9 @@ class Bruno:
             self.frame_period = 4
         else:
             self.frame_period = 6
+        if self.life_stage == ELDER:
+            # Slower animations and slower walks for old bruno.
+            self.frame_period = int(self.frame_period * 1.5) or 1
 
     # ---- interactions ----
 
@@ -285,11 +351,15 @@ class Bruno:
         self.hunger = max(0, self.hunger - 40)
         self.mood = min(100, self.mood + 15)
         self.say("om nom nom", ticks=40)
+        f = self.current_frame()
+        self.particles.spawn_feed_spark(self.x, self.y, f.width, f.height)
         self._enter(HAPPY, 30)
 
     def pet(self) -> None:
         self.mood = min(100, self.mood + 8)
         self.say(random.choice(["<3", "*purr*", ":3", "more please"]), ticks=30)
+        f = self.current_frame()
+        self.particles.spawn_pet_spark(self.x, self.y, f.width, f.height)
         self._enter(HAPPY, 25)
 
     def poke(self) -> None:
@@ -305,3 +375,110 @@ class Bruno:
     def say(self, text: str, ticks: int = 60) -> None:
         self.speech = text
         self.speech_ticks = ticks
+
+    # ---- Phase 2 reactions ----
+
+    _FILETYPE_REACTIONS = {
+        "py": "snake!",
+        "rs": "crab!",
+        "go": "gopher!",
+        "md": "wordy.",
+        "ts": "yarn.",
+        "tsx": "yarn.",
+        "js": "yarn.",
+        "jsx": "yarn.",
+        "nix": "snowflake!",
+        "lua": "moon time",
+        "c": "old school",
+        "cpp": "++!",
+        "h": "headers...",
+        "sh": "shellz",
+        "zsh": "shellz",
+        "bash": "shellz",
+        "html": "marked up",
+        "css": "stylin'",
+        "json": "{braces}",
+        "yaml": "yamls",
+        "yml": "yamls",
+        "toml": "configgy",
+        "sql": "tables!",
+        "txt": "plain text",
+    }
+
+    def react_commit(self, branch: str | None = None, short: str | None = None) -> None:
+        msg = "+1 commit!" if not short else f"+1 ({short})"
+        self.say(msg, ticks=45)
+        self.mood = min(100, self.mood + 4)
+        self._enter(HAPPY, 25)
+
+    def react_push(self) -> None:
+        self.say("bye bytes!", ticks=45)
+        self.mood = min(100, self.mood + 3)
+        self._enter(HAPPY, 25)
+
+    def react_branch(self, name: str | None = None) -> None:
+        msg = f"new branch: {name}" if name else "new branch!"
+        if len(msg) > 28:
+            msg = msg[:27] + "…"
+        self.say(msg, ticks=45)
+        self._enter(LOOK, 20)
+
+    def react_fail(self, code: int | None = None) -> None:
+        self.say(random.choice(["oof.", "?!", "yikes", "*concerned*"]), ticks=40)
+        self.mood = max(0, self.mood - 3)
+        self._enter(LOOK, 18)
+
+    def react_long_done(self, seconds: float) -> None:
+        self.say(random.choice(["phew!", "done!", "finally."]), ticks=40)
+        self._enter(HAPPY, 20)
+
+    def react_filetype(self, ext: str) -> None:
+        ext = ext.lower().lstrip(".")
+        msg = self._FILETYPE_REACTIONS.get(ext, "neat.")
+        self.say(msg, ticks=40)
+        self._enter(LOOK, 18)
+
+    def react_llm(self, text: str) -> None:
+        self.say(text, ticks=60)
+
+    # ---- Phase 4 magic-word reactions ----
+
+    def react_stats(self) -> None:
+        days = int(self.age_days)
+        self.say(
+            f"hp:{100 - self.hunger} en:{self.energy} mo:{self.mood} d:{days}",
+            ticks=60,
+        )
+
+    def react_hide(self) -> None:
+        if not self._hidden:
+            self.say("*poof*", ticks=18)
+        self._hidden = True
+
+    def react_show(self) -> None:
+        self._hidden = False
+        self.say("*back!*", ticks=24)
+
+    # ---- Phase 3 cell exports ----
+
+    def particle_cells(self) -> list[tuple[int, int, str, str | None]]:
+        return self.particles.cells()
+
+    def aura_cells(self, sprite_w: int, sprite_h: int) \
+            -> list[tuple[int, int, str, str | None]]:
+        aura = sprites.aura_for(self.mood, self.hunger, self.energy,
+                                self.life_stage, sprite_w)
+        if aura is None:
+            return []
+        text, sgr = aura
+        row_y = self.y + sprite_h
+        if row_y < 0 or row_y >= self.pane_h:
+            return []
+        cells: list[tuple[int, int, str, str | None]] = []
+        for dx, ch in enumerate(text):
+            if ch == " ":
+                continue
+            col = self.x + dx
+            if 0 <= col < self.pane_w:
+                cells.append((row_y, col, ch, sgr))
+        return cells
