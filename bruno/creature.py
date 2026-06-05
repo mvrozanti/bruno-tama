@@ -45,7 +45,8 @@ class Frame:
 
 class Bruno:
     def __init__(self, pane_w: int, pane_h: int, dev_mode: bool = False,
-                 can_place=None, persisted: dict | None = None):
+                 can_place=None, persisted: dict | None = None,
+                 on_pane_exit=None):
         self.pane_w = pane_w
         self.pane_h = pane_h
         self.dev_mode = dev_mode
@@ -56,6 +57,12 @@ class Bruno:
             lambda x, y, w, h: x >= 0 and y >= 0
             and x + w <= self.pane_w and y + h <= self.pane_h
         )
+        # Callback fired when a walk step would carry bruno outside the
+        # pane. Signature: on_pane_exit(dx, dy, new_x, new_y, frame) -> bool.
+        # Return True if the exit was handled (e.g., ownership transferred
+        # to a sibling pane) so the caller stops the current walk; False to
+        # fall through to the default turn-around behavior.
+        self.on_pane_exit = on_pane_exit
 
         self.x = pane_w // 2
         self.y = pane_h // 2
@@ -268,6 +275,14 @@ class Bruno:
                 or new_y + f.height > self.pane_h
             )
             if out_of_bounds:
+                if self.on_pane_exit is not None:
+                    try:
+                        handled = self.on_pane_exit(self.dx, self.dy,
+                                                    new_x, new_y, f)
+                    except Exception:
+                        handled = False
+                    if handled:
+                        return
                 # Hit a pane edge, not an obstacle — turn around, no squish.
                 self._pick_walk_direction()
                 return

@@ -29,7 +29,7 @@ import tty
 import pyte
 
 from . import llm as llm_mod
-from . import say, shellhook, state, tmux
+from . import coord, say, shellhook, state, tmux
 from .creature import Bruno
 
 ESC = "\x1b"
@@ -610,20 +610,81 @@ def run(args) -> int:
         if x < 0 or y < 0 or x + w > cols or y + h > rows:
             return False
         for dy in range(h):
+            row = y + dy
             for dx in range(w):
-                if (x + dx, y + dy) in occupancy:
+                if (x + dx, row) in occupancy:
                     return False
         return True
 
     persisted = state.load()
+
+    # ---- Window-scoped coordination ----
+    # In tmux, multiple bruno overlays (one per pane) collaborate so only
+    # ONE bruno is rendered per window. Stats live in state.json (already
+    # shared); position is per-process, with a handoff blob passed via the
+    # window-scope runtime file when bruno walks past a pane edge.
+    window_id_str = tmux.window_id()
+    my_pane_id = tmux.current_pane_id()
+    my_pid = os.getpid()
+    coord_active = bool(window_id_str and my_pane_id)
+    pane_layout_cache: list[dict] = []
+    layout_refresh_at = 0.0
+    layout_refresh_s = 0.5
+    am_owner = not coord_active
+    was_owner = am_owner
+    pending_exit: dict | None = None
+
+    def _refresh_layout(now: float) -> None:
+        nonlocal pane_layout_cache, layout_refresh_at
+        if not coord_active:
+            return
+        if now < layout_refresh_at:
+            return
+        layout_refresh_at = now + layout_refresh_s
+        pane_layout_cache = tmux.window_pane_layout()
+
+    def _on_pane_exit(dx: int, dy: int, new_x: int, new_y: int, frame) -> bool:
+        """Bruno tries to walk off this pane's edge. Hand off to a
+        neighbor pane if one exists; otherwise let the default
+        turn-around behavior run.
+        """
+        nonlocal pending_exit
+        if not coord_active or not am_owner:
+            return False
+        if not pane_layout_cache:
+            return False
+        result = tmux.neighbor_pane(
+            pane_layout_cache, my_pane_id, dx, dy, new_x, new_y,
+            frame.width, frame.height,
+        )
+        if result is None:
+            return False
+        neighbor, entry_x, entry_y = result
+        pending_exit = {
+            "to_pane_id": neighbor["pane_id"],
+            "entry_x": entry_x,
+            "entry_y": entry_y,
+            "dx": dx,
+            "dy": dy,
+        }
+        return True
+
     bruno = Bruno(cols, rows, dev_mode=args.dev, can_place=_can_place,
-                  persisted=persisted)
+                  persisted=persisted, on_pane_exit=_on_pane_exit)
     save_every_ticks = 300
 
     def _persist():
         merged = dict(persisted)
         merged.update(bruno.persist_dict())
         state.save(merged)
+
+    def _reload_stats():
+        """After ownership changes hands, pull fresh stats from state.json
+        so we don't keep mutating stale numbers."""
+        fresh = state.load()
+        for k in ("hunger", "energy", "mood", "born_at_wall"):
+            if k in fresh:
+                setattr(bruno, k, fresh[k])
     # Spawn in open space rather than against the right edge so the
     # random walk has room in every direction from the start.
     _initial_frame = bruno.current_frame()
@@ -853,6 +914,46 @@ def run(args) -> int:
                 if hidden[0] or bruno._hidden:
                     compositor.clear()
                     continue
+
+                # ---- Ownership: one bruno per tmux window ----
+                _refresh_layout(now)
+                if coord_active:
+                    am_owner = coord.claim_or_refresh(
+                        window_id_str, my_pid, my_pane_id
+                    )
+                else:
+                    am_owner = True
+                if am_owner and not was_owner:
+                    _reload_stats()
+                    incoming = coord.pop_handoff(window_id_str, my_pane_id) \
+                        if coord_active else None
+                    if incoming:
+                        f0 = bruno.current_frame()
+                        bruno.x = max(0, min(cols - f0.width,
+                                             int(incoming.get("x", bruno.x))))
+                        bruno.y = max(0, min(rows - f0.height,
+                                             int(incoming.get("y", bruno.y))))
+                        bruno.dx = int(incoming.get("dx", bruno.dx))
+                        bruno.dy = int(incoming.get("dy", bruno.dy))
+                        if bruno.dx != 0:
+                            bruno._last_facing = 1 if bruno.dx > 0 else -1
+                        from .creature import WALK
+                        bruno._enter(WALK, 80)
+                was_owner = am_owner
+
+                if coord_active and not am_owner:
+                    # Non-owner: ferry shell-hook reactions to the owner,
+                    # then disappear from this pane.
+                    if hook_fd is not None:
+                        for event in shellhook.drain_events(hook_fd, hook_buf):
+                            decision = shellhook.interpret(event)
+                            if not decision:
+                                continue
+                            method_name, method_args = decision
+                            coord.push_event(window_id_str, method_name,
+                                             list(method_args))
+                    compositor.clear()
+                    continue
                 # A small whitelist of TUIs (default: gemini, qwen) needs
                 # bruno to step aside entirely while they're running —
                 # their redraw pattern collides with the overlay and
@@ -876,8 +977,42 @@ def run(args) -> int:
                 bruno.tick_once()
                 activity_idle_ticks += 1
 
+                if pending_exit is not None and coord_active:
+                    # Bruno walked off this pane's edge into a neighbor.
+                    # Persist stats so the receiver picks them up, post
+                    # the handoff blob, drop ownership, and vanish locally.
+                    try:
+                        _persist()
+                    except Exception:
+                        pass
+                    coord.post_handoff(
+                        window_id_str, my_pid,
+                        pending_exit["to_pane_id"],
+                        pending_exit["entry_x"], pending_exit["entry_y"],
+                        pending_exit["dx"], pending_exit["dy"],
+                    )
+                    pending_exit = None
+                    am_owner = False
+                    was_owner = False
+                    compositor.clear()
+                    continue
+
                 if bruno.tick % save_every_ticks == 0:
                     _persist()
+
+                if coord_active:
+                    for ev in coord.drain_events(window_id_str, my_pid):
+                        method_name = ev.get("name")
+                        if not method_name:
+                            continue
+                        method = getattr(bruno, method_name, None)
+                        if method is None:
+                            continue
+                        method_args = ev.get("args") or []
+                        try:
+                            method(*method_args)
+                        except Exception:
+                            pass
 
                 if hook_fd is not None:
                     for event in shellhook.drain_events(hook_fd, hook_buf):
@@ -995,6 +1130,11 @@ def run(args) -> int:
             _persist()
         except Exception:
             pass
+        if coord_active:
+            try:
+                coord.release(window_id_str, my_pid)
+            except Exception:
+                pass
         if hook_fd is not None:
             try:
                 os.close(hook_fd)
