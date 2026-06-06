@@ -596,6 +596,7 @@ def run(args) -> int:
 
     occupancy: set[tuple[int, int]] = set()
     selected_rows: set[int] = set()
+    child_exited_naturally = False
 
     def _rebuild_occupancy():
         occupancy.clear()
@@ -860,8 +861,10 @@ def run(args) -> int:
                 try:
                     data = os.read(master_fd, 8192)
                 except OSError:
+                    child_exited_naturally = True
                     break
                 if not data:
+                    child_exited_naturally = True
                     break
                 # Drain everything immediately available so a single read
                 # boundary doesn't strand a partial escape sequence on the
@@ -1220,8 +1223,10 @@ def run(args) -> int:
         except (ProcessLookupError, PermissionError):
             pass
         try:
-            _, status = os.waitpid(pid, 0)
-            return os.waitstatus_to_exitcode(status) if hasattr(os, "waitstatus_to_exitcode") else 0
+            os.waitpid(pid, 0)
         except ChildProcessError:
-            return 0
+            pass
+        if child_exited_naturally:
+            return 42
+        return 0
     return 0
