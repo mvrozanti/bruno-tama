@@ -51,6 +51,40 @@ SPEECH_CHANCE_PER_TICK = 0.005
 PYTE_FEED_MAX = 65536
 
 
+def _strip_kitty_apc(data: bytes) -> bytes:
+    """Drop `\\e_G…\\e\\\\` kitty-graphics APC replies from a stdin batch.
+
+    Crush (and other charmbracelet TUIs) probe kitty graphics support
+    via tmux DCS passthrough. When the host terminal IS kitty, it
+    replies with `\\e_Gi=<n>;OK\\e\\\\`. Without bruno that reply never
+    reaches the inner pane — tmux drops it — so crush times out and
+    runs without graphics. With bruno wrapping the shell, the reply
+    DOES reach our stdin (tmux delivers it to the pane we own), we
+    forward it to the inner PTY, and crush is now past its probe
+    window: the bytes land in its main input buffer as `Gi=31;OK`.
+    Strip the APC reply on the way through so the inner TUI behaves
+    the same as it does without bruno.
+    """
+    if b"\x1b_G" not in data:
+        return data
+    out = bytearray()
+    i = 0
+    n = len(data)
+    while i < n:
+        if i + 1 < n and data[i] == 0x1b and data[i + 1] == 0x5f \
+                and i + 2 < n and data[i + 2] == 0x47:
+            j = i + 3
+            while j + 1 < n and not (data[j] == 0x1b and data[j + 1] == 0x5c):
+                j += 1
+            if j + 1 < n:
+                i = j + 2
+                continue
+            break
+        out.append(data[i])
+        i += 1
+    return bytes(out)
+
+
 def _set_winsize(fd: int, rows: int, cols: int) -> None:
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
@@ -852,7 +886,7 @@ def run(args) -> int:
                             if mouse_mod.hits_bruno(bruno, col, row):
                                 bruno.feed()
                         if passthrough:
-                            os.write(master_fd, passthrough)
+                            os.write(master_fd, _strip_kitty_apc(passthrough))
                         activity_idle_ticks = 0
                 except OSError:
                     pass
