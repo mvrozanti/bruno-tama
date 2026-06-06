@@ -115,6 +115,26 @@ class ParticleSystem:
                 sgr=sgr,
             ))
 
+    def spawn_burp(self, bx: int, by: int, bw: int, bh: int,
+                   text: str, facing: int = 1) -> None:
+        glyphs = [c for c in text if not c.isspace()][:8]
+        if not glyphs:
+            return
+        direction = 1 if facing >= 0 else -1
+        start_x = bx + bw if direction > 0 else bx - 1
+        mouth_y = by + max(0, bh // 2)
+        for i, g in enumerate(glyphs):
+            self.particles.append(Particle(
+                x=start_x + i * direction,
+                y=mouth_y + (-1 if i % 2 == 0 else 0),
+                glyph=g,
+                ttl=18 + i,
+                vx=direction,
+                vy=-1 if i % 3 == 0 else 0,
+                step_period=3,
+                sgr=DIM_YELLOW,
+            ))
+
     def spawn_dust(self, old_x: int, old_y: int, w: int, h: int) -> None:
         if w <= 0 or h <= 0:
             return

@@ -171,6 +171,38 @@ def neighbor_pane(layout: list[dict], my_pane_id: str,
     return None
 
 
+def selection_rows() -> tuple[int, int] | None:
+    """(top_row, bottom_row) of active tmux copy-mode selection in bruno's pane.
+
+    Pinned to $TMUX_PANE so switching tmux windows or panes doesn't make
+    bruno read another pane's copy-mode state. Only valid when scroll_position
+    is 0 (user at live screen). Returns None if no selection or scrolled up.
+    """
+    if not in_tmux():
+        return None
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return None
+    out = _tmux(
+        "display-message", "-p", "-t", pane,
+        "#{selection_active}|#{selection_start_y}|#{selection_end_y}|#{scroll_position}",
+    )
+    if not out:
+        return None
+    parts = out.strip().split("|")
+    if len(parts) != 4 or parts[0] != "1":
+        return None
+    try:
+        start_y = int(parts[1])
+        end_y = int(parts[2])
+        scroll_pos = int(parts[3])
+    except ValueError:
+        return None
+    if scroll_pos != 0:
+        return None
+    return min(start_y, end_y), max(start_y, end_y)
+
+
 def capture_pane(pane_id: str, lines: int = 50) -> str | None:
     """Snapshot a pane's visible content. Bruno can sniff for keywords."""
     out = _tmux("capture-pane", "-p", "-t", pane_id, "-S", f"-{lines}")

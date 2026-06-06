@@ -370,6 +370,18 @@ class Bruno:
         self.particles.spawn_feed_spark(self.x, self.y, f.width, f.height)
         self._enter(HAPPY, 30)
 
+    def burp(self, text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        label = text if len(text) <= 12 else text[:11] + "…"
+        self.say(f"*ptui* {label}", ticks=40)
+        self.mood = max(0, self.mood - 2)
+        f = self.current_frame()
+        self.particles.spawn_burp(self.x, self.y, f.width, f.height,
+                                  text, self.facing)
+        self._enter(LOOK, 22)
+
     def pet(self) -> None:
         self.mood = min(100, self.mood + 8)
         self.say(random.choice(["<3", "*purr*", ":3", "more please"]), ticks=30)

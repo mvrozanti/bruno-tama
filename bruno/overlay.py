@@ -29,7 +29,7 @@ import tty
 import pyte
 
 from . import llm as llm_mod
-from . import coord, say, shellhook, state, tmux
+from . import coord, food, mouse as mouse_mod, say, shellhook, state, tmux
 from .creature import Bruno
 
 ESC = "\x1b"
@@ -595,6 +595,7 @@ def run(args) -> int:
         debug_log = open(os.environ["BRUNO_DEBUG"], "a", buffering=1)
 
     occupancy: set[tuple[int, int]] = set()
+    selected_rows: set[int] = set()
 
     def _rebuild_occupancy():
         occupancy.clear()
@@ -611,6 +612,8 @@ def run(args) -> int:
             return False
         for dy in range(h):
             row = y + dy
+            if row in selected_rows:
+                return False
             for dx in range(w):
                 if (x + dx, row) in occupancy:
                     return False
@@ -719,9 +722,18 @@ def run(args) -> int:
     signal.signal(signal.SIGUSR1, on_usr1)
 
     old_attrs = None
+    mouse_on = False
     if sys.stdin.isatty():
         old_attrs = termios.tcgetattr(sys.stdin.fileno())
         tty.setraw(sys.stdin.fileno())
+        try:
+            os.write(sys.stdout.fileno(), mouse_mod.ENABLE)
+            mouse_on = True
+        except OSError:
+            pass
+
+    stdin_buf = bytearray()
+    mouse_reenable_at = 0.0
 
     # Sync the visible terminal to pyte's fresh-start view. Otherwise any
     # pre-existing rows (nix warnings, last command output) leave terminal
@@ -829,7 +841,17 @@ def run(args) -> int:
                 try:
                     data = os.read(sys.stdin.fileno(), 4096)
                     if data:
-                        os.write(master_fd, data)
+                        stdin_buf.extend(data)
+                        passthrough, mouse_events = mouse_mod.parse(stdin_buf)
+                        for btn, col, row, term in mouse_events:
+                            if not mouse_mod.is_left_press(btn, term):
+                                continue
+                            if bruno._hidden or hidden[0]:
+                                continue
+                            if mouse_mod.hits_bruno(bruno, col, row):
+                                bruno.feed()
+                        if passthrough:
+                            os.write(master_fd, passthrough)
                         activity_idle_ticks = 0
                 except OSError:
                     pass
@@ -873,7 +895,15 @@ def run(args) -> int:
                 except OSError:
                     pass
                 if len(data) <= PYTE_FEED_MAX:
-                    stream.feed(data)
+                    try:
+                        stream.feed(data)
+                    except Exception:
+                        # pyte 0.8.2 raises on private CSI sequences whose
+                        # dispatcher doesn't accept private= (e.g. crush's
+                        # \e[>4m modifyOtherKeys). Swallowing keeps bruno
+                        # alive; the screen view goes briefly stale until
+                        # the next clean sequence resets the parser.
+                        pass
                 activity_idle_ticks = 0
                 last_shell_byte = time.monotonic()
 
@@ -891,6 +921,14 @@ def run(args) -> int:
                 next_tick += tick_interval
                 if next_tick < now:
                     next_tick = now + tick_interval
+                if mouse_on and now >= mouse_reenable_at:
+                    # Some TUIs (less, vim, fzf) disable SGR mouse on exit.
+                    # Re-emit periodically so click-to-feed survives them.
+                    mouse_reenable_at = now + 3.0
+                    try:
+                        os.write(sys.stdout.fileno(), mouse_mod.ENABLE)
+                    except OSError:
+                        pass
                 try:
                     child_cwd = os.readlink(f"/proc/{pid}/cwd")
                     if child_cwd != tracked_cwd:
@@ -973,6 +1011,14 @@ def run(args) -> int:
                         last_passthrough = True
                     continue
                 last_passthrough = False
+                if tmux.in_tmux() and bruno.tick % 3 == 0:
+                    sel = tmux.selection_rows()
+                    if sel is None:
+                        selected_rows.clear()
+                    else:
+                        top, bot = sel
+                        selected_rows.clear()
+                        selected_rows.update(range(top, bot + 1))
                 _rebuild_occupancy()
                 bruno.tick_once()
                 activity_idle_ticks += 1
@@ -1045,8 +1091,12 @@ def run(args) -> int:
                             os.lseek(feed_fd, 0, os.SEEK_SET)
                         except OSError:
                             pass
+                        offering = chunk.decode("utf-8", errors="replace").strip()
                         try:
-                            bruno.feed()
+                            if food.is_food(offering):
+                                bruno.feed()
+                            elif offering:
+                                bruno.burp(offering)
                         except Exception:
                             pass
 
@@ -1151,6 +1201,11 @@ def run(args) -> int:
             except Exception:
                 pass
         compositor.clear()
+        if mouse_on:
+            try:
+                os.write(sys.stdout.fileno(), mouse_mod.DISABLE)
+            except OSError:
+                pass
         try:
             os.write(sys.stdout.fileno(), (RESET_SGR + SHOW_CURSOR).encode())
         except OSError:

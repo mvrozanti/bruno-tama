@@ -12,7 +12,7 @@ import tty
 from contextlib import contextmanager
 
 from . import llm as llm_mod
-from . import render, say, state, tmux
+from . import food, mouse as mouse_mod, render, say, state, tmux
 from .creature import Bruno, IDLE, WALK, SLEEP, HUNGRY, HAPPY, SQUISH, LOOK
 
 TICK_MS = 100   # 10 fps
@@ -46,6 +46,22 @@ def read_key(fd) -> str | None:
     except Exception:
         return None
     return ch
+
+
+def drain_stdin(fd, buf: bytearray) -> None:
+    if fd is None:
+        return
+    while True:
+        r, _, _ = select.select([fd], [], [], 0)
+        if not r:
+            return
+        try:
+            chunk = os.read(fd, 256)
+        except OSError:
+            return
+        if not chunk:
+            return
+        buf.extend(chunk)
 
 
 def pick_bubble_position(bruno_x: int, bruno_y: int, bruno_w: int,
@@ -162,6 +178,14 @@ def main() -> int:
         feed_fd = None
 
     with render.screen(), cbreak_stdin() as fd:
+        mouse_on = False
+        if fd is not None:
+            try:
+                os.write(sys.stdout.fileno(), mouse_mod.ENABLE)
+                mouse_on = True
+            except OSError:
+                pass
+        stdin_buf = bytearray()
         try:
             last_activity = None
             activity_counter = 0
@@ -179,13 +203,26 @@ def main() -> int:
                     sys.stdout.flush()
                     resize_pending[0] = False
 
-                # Keyboard interactions
-                while True:
-                    key = read_key(fd)
-                    if key is None:
+                # Keyboard + mouse interactions
+                drain_stdin(fd, stdin_buf)
+                passthrough, mouse_events = mouse_mod.parse(stdin_buf)
+                for btn, col, row, term in mouse_events:
+                    if not mouse_mod.is_left_press(btn, term):
+                        continue
+                    if bruno._hidden:
+                        continue
+                    if mouse_mod.hits_bruno(bruno, col, row):
+                        bruno.feed()
+                quit_now = False
+                for kb in passthrough:
+                    if kb >= 0x80:
+                        continue
+                    key = chr(kb)
+                    if key == "\x04":
+                        return 42
+                    if key in ("q", "Q", "\x03"):
+                        quit_now = True
                         break
-                    if key in ("q", "Q", "\x03", "\x04"):  # q, Ctrl-C, Ctrl-D
-                        return 0
                     if key in (" ", "p"):
                         bruno.pet()
                     elif key == "f":
@@ -197,6 +234,8 @@ def main() -> int:
                     elif key == "s":
                         # Force a fresh phrase
                         bruno.say(say.pick(bruno.state, dev_mode=args.dev), ticks=50)
+                if quit_now:
+                    return 0
 
                 bruno.tick_once()
 
@@ -250,8 +289,12 @@ def main() -> int:
                             os.lseek(feed_fd, 0, os.SEEK_SET)
                         except OSError:
                             pass
+                        offering = chunk.decode("utf-8", errors="replace").strip()
                         try:
-                            bruno.feed()
+                            if food.is_food(offering):
+                                bruno.feed()
+                            elif offering:
+                                bruno.burp(offering)
                         except Exception:
                             pass
 
@@ -291,6 +334,11 @@ def main() -> int:
             return 0
         finally:
             _persist()
+            if mouse_on:
+                try:
+                    os.write(sys.stdout.fileno(), mouse_mod.DISABLE)
+                except OSError:
+                    pass
             if feed_fd is not None:
                 try:
                     os.close(feed_fd)
