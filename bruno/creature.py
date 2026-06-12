@@ -197,9 +197,12 @@ class Bruno:
         if self.tick % self.frame_period == 0:
             self.frame_idx += 1
 
-        # Drift stats slowly. Tick is 100ms so 600 ticks = 1 minute.
-        if self.tick % 60 == 0:
+        # Tick is 100ms so 600 ticks = 1 minute.
+        # Hunger drifts on a weekly cadence: 0 -> 100 in 7 days of runtime so
+        # one feeding per week keeps bruno fed.
+        if self.tick % 60480 == 0:
             self.hunger = min(100, self.hunger + 1)
+        if self.tick % 60 == 0:
             if self.state == SLEEP:
                 self.energy = min(100, self.energy + 2)
             else:
