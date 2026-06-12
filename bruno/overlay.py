@@ -29,7 +29,7 @@ import tty
 import pyte
 
 from . import llm as llm_mod
-from . import coord, food, mouse as mouse_mod, say, shellhook, state, tmux
+from . import coord, food, mouse as mouse_mod, say, shellhook, sprites, state, tmux
 from .creature import Bruno
 
 ESC = "\x1b"
@@ -216,6 +216,12 @@ class Compositor:
     def __init__(self, stdout_fd: int, screen: pyte.Screen, debug=None):
         self.stdout_fd = stdout_fd
         self.screen = screen
+        # Real-terminal bounds. Identical to the pyte screen's dims in
+        # free-roam, larger while docked (the child PTY shrinks but the
+        # terminal doesn't) — draw clipping must use these, not
+        # screen.lines, or the dock strip becomes unreachable.
+        self.term_rows = screen.lines
+        self.term_cols = screen.columns
         self._last_cells: set[tuple[int, int]] = set()
         self._last_bubble_cells: set[tuple[int, int]] = set()
         self._last_particle_cells: set[tuple[int, int]] = set()
@@ -239,9 +245,9 @@ class Compositor:
                     continue
                 row = y + dy
                 col = x + dx
-                if row < 0 or row >= self.screen.lines:
+                if row < 0 or row >= self.term_rows:
                     continue
-                if col < 0 or col >= self.screen.columns:
+                if col < 0 or col >= self.term_cols:
                     continue
                 new_cells.add((row, col))
                 out.append(_move_to(row, col) + ch)
@@ -253,9 +259,9 @@ class Compositor:
                         continue
                     row = by + dy
                     col = bx + dx
-                    if row < 0 or row >= self.screen.lines:
+                    if row < 0 or row >= self.term_rows:
                         continue
-                    if col < 0 or col >= self.screen.columns:
+                    if col < 0 or col >= self.term_cols:
                         continue
                     new_bubble_cells.add((row, col))
                     out.append(_move_to(row, col) + DIM_SGR + ch + RESET_SGR)
@@ -264,9 +270,9 @@ class Compositor:
             for row, col, ch, sgr in particle_cells:
                 if ch == " ":
                     continue
-                if row < 0 or row >= self.screen.lines:
+                if row < 0 or row >= self.term_rows:
                     continue
-                if col < 0 or col >= self.screen.columns:
+                if col < 0 or col >= self.term_cols:
                     continue
                 if (row, col) in new_cells or (row, col) in new_bubble_cells:
                     continue
@@ -632,6 +638,15 @@ def run(args) -> int:
     selected_rows: set[int] = set()
     child_exited_naturally = False
 
+    # ---- Dock mode ----
+    # While a passthrough TUI runs, the child PTY is shrunk by dock_h rows
+    # (TIOCSWINSZ) and bruno lives in the reserved bottom strip — zero
+    # shared cells, zero redraw collision. A DECSTBM scroll region pinned
+    # to the child's rows keeps its newline-scrolls out of the strip.
+    docked = False
+    child_rows = rows
+    dock_h = 0
+
     def _rebuild_occupancy():
         occupancy.clear()
         buf = screen.buffer
@@ -643,6 +658,9 @@ def run(args) -> int:
                     occupancy.add((x, y))
 
     def _can_place(x, y, w, h):
+        if docked:
+            # Dock strip only: bottom-anchored, horizontal freedom.
+            return 0 <= x and x + w <= cols and y == rows - h
         if x < 0 or y < 0 or x + w > cols or y + h > rows:
             return False
         for dy in range(h):
@@ -737,6 +755,49 @@ def run(args) -> int:
         bruno.y = max(0, rows // 2 - 1)
 
     compositor = Compositor(sys.stdout.fileno(), screen, debug=debug_log)
+
+    def _write_stdout(s: str) -> None:
+        try:
+            os.write(sys.stdout.fileno(), s.encode("utf-8", errors="replace"))
+        except OSError:
+            pass
+
+    def _dock_strip_clear_seq() -> str:
+        return "".join(_move_to(r, 0) + ESC + "[2K"
+                       for r in range(child_rows, rows))
+
+    def _dock_margin_seq() -> str:
+        return f"{ESC}[1;{child_rows}r"
+
+    def _enter_dock() -> None:
+        nonlocal docked, child_rows, dock_h
+        dock_h = 3
+        if sprites.decoration_for_today(bruno.born_at_wall) is not None:
+            dock_h += 1
+        if rows < dock_h + 4:
+            return
+        compositor.clear()
+        docked = True
+        child_rows = rows - dock_h
+        _set_winsize(master_fd, child_rows, cols)
+        screen.resize(child_rows, cols)
+        _write_stdout(SAVE_CUR + _dock_margin_seq()
+                      + _dock_strip_clear_seq() + RESTORE_CUR)
+        f = bruno.current_frame()
+        bruno.x = max(0, min(bruno.x, cols - f.width))
+        bruno.y = max(0, rows - f.height)
+
+    def _exit_dock() -> None:
+        nonlocal docked, child_rows
+        if not docked:
+            return
+        compositor.clear()
+        docked = False
+        _write_stdout(SAVE_CUR + ESC + "[r"
+                      + _dock_strip_clear_seq() + RESTORE_CUR)
+        child_rows = rows
+        _set_winsize(master_fd, rows, cols)
+        screen.resize(rows, cols)
 
     resize_pending = [False]
     # SIGUSR1 toggles bruno-visible without unwrapping the shell. Lets a
@@ -867,8 +928,20 @@ def run(args) -> int:
                     # bruno's old glyphs as trails on the new layout.
                     compositor.clear()
                     cols, rows = new_cols, new_rows
-                    _set_winsize(master_fd, rows, cols)
-                    screen.resize(rows, cols)
+                    compositor.term_rows = rows
+                    compositor.term_cols = cols
+                    if docked and rows >= dock_h + 4:
+                        child_rows = rows - dock_h
+                        _set_winsize(master_fd, child_rows, cols)
+                        screen.resize(child_rows, cols)
+                        _write_stdout(SAVE_CUR + _dock_margin_seq()
+                                      + _dock_strip_clear_seq() + RESTORE_CUR)
+                    else:
+                        if docked:
+                            _exit_dock()
+                        child_rows = rows
+                        _set_winsize(master_fd, rows, cols)
+                        screen.resize(rows, cols)
                     bruno.resize(cols, rows)
                     # last_cells already cleared by compositor.clear() above
 
@@ -950,7 +1023,11 @@ def run(args) -> int:
                 # them at their shifted positions with whatever pyte now
                 # shows there. Bruno re-overlays on the next tick.
                 if screen.scroll_delta:
-                    compositor.handle_scroll(screen.scroll_delta, rows)
+                    # Docked, the scroll region pins the child's scrolling
+                    # to its own rows — the dock strip never shifts, so
+                    # bruno's cells need no correction.
+                    if not docked:
+                        compositor.handle_scroll(screen.scroll_delta, rows)
                     screen.scroll_delta = 0
 
             now = time.monotonic()
@@ -1017,6 +1094,8 @@ def run(args) -> int:
                 was_owner = am_owner
 
                 if coord_active and not am_owner:
+                    if docked:
+                        _exit_dock()
                     # Non-owner: ferry shell-hook reactions to the owner,
                     # then disappear from this pane.
                     if hook_fd is not None:
@@ -1029,25 +1108,67 @@ def run(args) -> int:
                                              list(method_args))
                     compositor.clear()
                     continue
-                # A small whitelist of TUIs (default: gemini, qwen) needs
-                # bruno to step aside entirely while they're running —
-                # their redraw pattern collides with the overlay and
-                # leaves bruno glyphs as garbage on every refresh. Other
-                # TUIs (vim, htop, claude, less) have always tolerated
-                # the overlap, so we keep the sprite visible there.
-                # Configurable via BRUNO_PASSTHROUGH=name1,name2 (or empty
-                # string to disable entirely).
+                # A small whitelist of TUIs (gemini, qwen, claude, crush
+                # via BRUNO_PASSTHROUGH) full-frame diff-render in a way
+                # that collides with the overlay — they never repaint
+                # bruno's foreign glyphs, leaving trails. While one runs,
+                # bruno docks: the child PTY shrinks by dock_h rows and he
+                # lives in the reserved bottom strip instead of vanishing.
+                # Set BRUNO_PASSTHROUGH= (empty) to disable entirely.
                 if now >= passthrough_next_check:
                     passthrough_next_check = now + passthrough_check_interval
                     passthrough_active = _has_passthrough_descendant(
                         pid, passthrough_names
                     )
                 if passthrough_active:
-                    if not last_passthrough:
-                        compositor.clear()
-                        last_passthrough = True
+                    if not docked:
+                        _enter_dock()
+                    if not docked:
+                        # Terminal too cramped for a dock strip — fall back
+                        # to the old hide-entirely behavior.
+                        if not last_passthrough:
+                            compositor.clear()
+                            last_passthrough = True
+                        continue
+                    last_passthrough = True
+                    bruno.tick_once()
+                    if bruno.tick % save_every_ticks == 0:
+                        _persist()
+                    if hook_fd is not None:
+                        for event in shellhook.drain_events(hook_fd, hook_buf):
+                            decision = shellhook.interpret(event)
+                            if not decision:
+                                continue
+                            method_name, method_args = decision
+                            is_verb = event and event[0] == "verb"
+                            if not is_verb and bruno.speech is not None:
+                                continue
+                            method = getattr(bruno, method_name, None)
+                            if method is None:
+                                continue
+                            try:
+                                method(*method_args)
+                            except Exception:
+                                pass
+                    f = bruno.current_frame()
+                    bruno.y = max(0, rows - f.height)
+                    bruno.x = max(0, min(bruno.x, cols - f.width))
+                    # Child resets (\e[r) land on the real terminal as a
+                    # full-real-screen region, exposing the strip to its
+                    # scrolling. Re-assert whenever pyte shows the child
+                    # holding full-view (or no) margins; a child's custom
+                    # region (vim, less) maps to the same real rows and is
+                    # left alone.
+                    m = screen.margins
+                    if m is None or (m.top == 0 and m.bottom >= child_rows - 1):
+                        _write_stdout(SAVE_CUR + _dock_margin_seq()
+                                      + RESTORE_CUR)
+                    compositor.render(f.lines, bruno.x, bruno.y,
+                                      None, 0, 0, None)
                     continue
                 last_passthrough = False
+                if docked:
+                    _exit_dock()
                 if tmux.in_tmux() and bruno.tick % 3 == 0:
                     sel = tmux.selection_rows()
                     if sel is None:
@@ -1237,6 +1358,8 @@ def run(args) -> int:
                 hook_install.cleanup()
             except Exception:
                 pass
+        if docked:
+            _write_stdout(ESC + "[r")
         compositor.clear()
         if mouse_on:
             try:
