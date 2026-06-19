@@ -1152,6 +1152,25 @@ def run(args) -> int:
                     bruno.tick_once()
                     if bruno.tick % save_every_ticks == 0:
                         _persist()
+                    if feed_fd is not None and bruno.speech is None:
+                        try:
+                            chunk = os.read(feed_fd, 256)
+                        except (BlockingIOError, OSError):
+                            chunk = b""
+                        if chunk:
+                            try:
+                                os.ftruncate(feed_fd, 0)
+                                os.lseek(feed_fd, 0, os.SEEK_SET)
+                            except OSError:
+                                pass
+                            offering = chunk.decode("utf-8", errors="replace").strip()
+                            try:
+                                if food.is_food(offering):
+                                    bruno.feed()
+                                elif offering:
+                                    bruno.burp(offering)
+                            except Exception:
+                                pass
                     if hook_fd is not None:
                         for event in shellhook.drain_events(hook_fd, hook_buf):
                             decision = shellhook.interpret(event)
