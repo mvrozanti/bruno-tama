@@ -904,17 +904,6 @@ def run(args) -> int:
     activity_idle_ticks = 0
     bubble_text: str | None = None
     bubble_until = 0.0
-    # If shell bytes arrived very recently, an os.read boundary may have
-    # split an escape sequence; injecting our SAVE_CUR / cursor-move into
-    # the middle of that sequence corrupts the terminal. Wait for the
-    # stream to settle before overlaying. The pyte parser sees the same
-    # bytes the terminal does — if pyte is mid-sequence, so is the
-    # terminal — so its `_taking_plain_text` flag is a more authoritative
-    # gate than the time window. Keep the time window as a backstop for
-    # cases where pyte's state doesn't reflect the wire (e.g., charset
-    # selection bytes that pyte handles but terminal hasn't yet).
-    shell_settle_s = 0.06
-    last_shell_byte = 0.0
     tracked_cwd: str | None = None
     passthrough_names = _passthrough_names()
     passthrough_active = False
@@ -1033,7 +1022,6 @@ def run(args) -> int:
                         # the next clean sequence resets the parser.
                         pass
                 activity_idle_ticks = 0
-                last_shell_byte = time.monotonic()
 
                 # On scroll, the terminal already shifted bruno's last-drawn
                 # cells along with everything else; pyte's buffer scrolled in
@@ -1068,24 +1056,32 @@ def run(args) -> int:
                         tracked_cwd = child_cwd
                 except OSError:
                     pass
-                # Skip the overlay this tick if the shell just wrote — the
-                # last byte may be the head of an unterminated escape and
-                # our SAVE_CUR would get parsed as its parameters. The
-                # _taking_plain_text flag is pyte's view of parser state
-                # for the bytes we've forwarded; if it's not True, the
-                # terminal is mid-sequence too.
+                # Detect a passthrough child BEFORE the settle gate. A child
+                # that streams continuously (claude) keeps the time window
+                # perpetually tripped; if the gate skipped the whole tick we
+                # would never reach the dock logic below, so bruno could
+                # never enter dock in the first place — a permanent freeze.
+                if now >= passthrough_next_check:
+                    passthrough_next_check = now + passthrough_check_interval
+                    passthrough_active = _has_passthrough_descendant(
+                        pid, passthrough_names
+                    )
+
+                # Skip the overlay this tick only if the terminal is mid
+                # escape sequence — injecting our SAVE_CUR there would be
+                # parsed as the sequence's parameters. The _taking_plain_text
+                # flag is pyte's parser state for the bytes we've forwarded;
+                # if pyte is mid-sequence, so is the terminal.
                 #
-                # The time window refreshes on every shell byte, so a TUI
-                # that streams continuously (claude, a passthrough child)
-                # keeps it perpetually tripped — which would freeze bruno's
-                # whole tick, not just his render, for the child's lifetime.
-                # Dock mode pins the child to its own scroll region, so the
-                # strip never shares cells with an in-flight sequence; lean
-                # on the authoritative parser-state gate alone there and
-                # drop the coarse time window so bruno keeps moving.
+                # We deliberately do NOT gate on a wall-clock settle window
+                # here: it refreshes on every shell byte, so a TUI that
+                # streams continuously (claude) would keep it perpetually
+                # tripped and freeze bruno for the child's whole lifetime.
+                # Parser-state is the authoritative check; between the
+                # discrete escape sequences a streaming app emits, pyte
+                # returns to plain-text and bruno renders, so he keeps
+                # roaming the full screen on top of the live TUI.
                 if getattr(stream, "_taking_plain_text", True) is not True:
-                    continue
-                if not docked and now - last_shell_byte < shell_settle_s:
                     continue
                 if hide_pending[0]:
                     compositor.clear()
@@ -1142,11 +1138,7 @@ def run(args) -> int:
                 # bruno docks: the child PTY shrinks by dock_h rows and he
                 # lives in the reserved bottom strip instead of vanishing.
                 # Set BRUNO_PASSTHROUGH= (empty) to disable entirely.
-                if now >= passthrough_next_check:
-                    passthrough_next_check = now + passthrough_check_interval
-                    passthrough_active = _has_passthrough_descendant(
-                        pid, passthrough_names
-                    )
+                # (passthrough_active is refreshed above, before the gate.)
                 if passthrough_active:
                     if not docked:
                         _enter_dock()
