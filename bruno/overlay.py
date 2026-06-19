@@ -1074,9 +1074,18 @@ def run(args) -> int:
                 # _taking_plain_text flag is pyte's view of parser state
                 # for the bytes we've forwarded; if it's not True, the
                 # terminal is mid-sequence too.
-                if now - last_shell_byte < shell_settle_s:
-                    continue
+                #
+                # The time window refreshes on every shell byte, so a TUI
+                # that streams continuously (claude, a passthrough child)
+                # keeps it perpetually tripped — which would freeze bruno's
+                # whole tick, not just his render, for the child's lifetime.
+                # Dock mode pins the child to its own scroll region, so the
+                # strip never shares cells with an in-flight sequence; lean
+                # on the authoritative parser-state gate alone there and
+                # drop the coarse time window so bruno keeps moving.
                 if getattr(stream, "_taking_plain_text", True) is not True:
+                    continue
+                if not docked and now - last_shell_byte < shell_settle_s:
                     continue
                 if hide_pending[0]:
                     compositor.clear()
