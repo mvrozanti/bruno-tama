@@ -673,6 +673,11 @@ def run(args) -> int:
         return True
 
     persisted = state.load()
+    _stat_baseline = {
+        "hunger": persisted.get("hunger", 50),
+        "energy": persisted.get("energy", 100),
+        "mood": persisted.get("mood", 80),
+    }
 
     # ---- Window-scoped coordination ----
     # In tmux, multiple bruno overlays (one per pane) collaborate so only
@@ -730,9 +735,19 @@ def run(args) -> int:
     save_every_ticks = 300
 
     def _persist():
-        merged = dict(persisted)
-        merged.update(bruno.persist_dict())
-        state.save(merged)
+        d = bruno.persist_dict()
+        delta = {
+            "hunger": d["hunger"] - _stat_baseline["hunger"],
+            "energy": d["energy"] - _stat_baseline["energy"],
+            "mood": d["mood"] - _stat_baseline["mood"],
+            "born_at_wall": d.get("born_at_wall"),
+            "llm_backend": persisted.get("llm_backend"),
+            "llm_prompted_on": persisted.get("llm_prompted_on"),
+        }
+        state.save_delta(delta)
+        _stat_baseline["hunger"] = d["hunger"]
+        _stat_baseline["energy"] = d["energy"]
+        _stat_baseline["mood"] = d["mood"]
 
     def _reload_stats():
         """After ownership changes hands, pull fresh stats from state.json
@@ -741,6 +756,9 @@ def run(args) -> int:
         for k in ("hunger", "energy", "mood", "born_at_wall"):
             if k in fresh:
                 setattr(bruno, k, fresh[k])
+        for k in ("hunger", "energy", "mood"):
+            if k in fresh:
+                _stat_baseline[k] = fresh[k]
     # Spawn in open space rather than against the right edge so the
     # random walk has room in every direction from the start.
     _initial_frame = bruno.current_frame()

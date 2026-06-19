@@ -142,6 +142,11 @@ def main() -> int:
     persisted = state.load()
     bruno = Bruno(pane_w, pane_h, dev_mode=args.dev, persisted=persisted)
     painter = render.Painter()
+    _stat_baseline = {
+        "hunger": persisted.get("hunger", 50),
+        "energy": persisted.get("energy", 100),
+        "mood": persisted.get("mood", 80),
+    }
 
     resize_pending = [False]
 
@@ -155,9 +160,19 @@ def main() -> int:
     save_every_ticks = 300
 
     def _persist():
-        merged = dict(persisted)
-        merged.update(bruno.persist_dict())
-        state.save(merged)
+        d = bruno.persist_dict()
+        delta = {
+            "hunger": d["hunger"] - _stat_baseline["hunger"],
+            "energy": d["energy"] - _stat_baseline["energy"],
+            "mood": d["mood"] - _stat_baseline["mood"],
+            "born_at_wall": d.get("born_at_wall"),
+            "llm_backend": persisted.get("llm_backend"),
+            "llm_prompted_on": persisted.get("llm_prompted_on"),
+        }
+        state.save_delta(delta)
+        _stat_baseline["hunger"] = d["hunger"]
+        _stat_baseline["energy"] = d["energy"]
+        _stat_baseline["mood"] = d["mood"]
 
     llm_backend = _resolve_llm_backend_pane(args, persisted)
     persisted["llm_backend"] = llm_backend
