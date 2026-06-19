@@ -29,7 +29,8 @@ import tty
 import pyte
 
 from . import llm as llm_mod
-from . import coord, food, mouse as mouse_mod, say, shellhook, sprites, state, tmux
+from . import (coord, feed as feed_mod, food, mouse as mouse_mod, say,
+               shellhook, sprites, state, tmux)
 from .creature import Bruno
 
 ESC = "\x1b"
@@ -870,19 +871,11 @@ def run(args) -> int:
     if hook_install is not None:
         hook_fd = shellhook.open_reader(hook_install.fifo_path)
 
-    # Phase 4: IPC feed file. Anyone can `echo "anything" > $XDG_RUNTIME_DIR/bruno_feed`
-    # (or /tmp/bruno_feed) to trigger a feed reaction. PID-agnostic so a
-    # single-user-multi-pane setup wakes every bruno; that's the intent.
-    feed_path = os.path.join(
-        os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
-        "bruno_feed",
-    )
-    feed_fd: int | None = None
-    try:
-        feed_fd = os.open(feed_path, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK, 0o600)
-        os.ftruncate(feed_fd, 0)
-    except OSError:
-        feed_fd = None
+    # Phase 4: IPC feed files. Anyone can drop text in a feed path
+    # (`echo 🍎 | bruno`, click-to-feed, or `echo … > /tmp/bruno_feed`)
+    # to trigger a reaction. PID-agnostic so a single-user-multi-pane
+    # setup wakes every bruno; that's the intent. See bruno/feed.py.
+    feed_fds = feed_mod.open_readers()
 
     pyte_scanner = PyteScanner()
     pyte_scan_every = 5  # every ~0.5s @ 10Hz
@@ -1153,22 +1146,13 @@ def run(args) -> int:
                     bruno.tick_once()
                     if bruno.tick % save_every_ticks == 0:
                         _persist()
-                    if feed_fd is not None and bruno.speech is None:
-                        try:
-                            chunk = os.read(feed_fd, 256)
-                        except (BlockingIOError, OSError):
-                            chunk = b""
-                        if chunk:
-                            try:
-                                os.ftruncate(feed_fd, 0)
-                                os.lseek(feed_fd, 0, os.SEEK_SET)
-                            except OSError:
-                                pass
-                            offering = chunk.decode("utf-8", errors="replace").strip()
+                    if bruno.speech is None:
+                        offering = feed_mod.read_offering(feed_fds)
+                        if offering:
                             try:
                                 if food.is_food(offering):
                                     bruno.feed()
-                                elif offering:
+                                else:
                                     bruno.burp(offering)
                             except Exception:
                                 pass
@@ -1276,22 +1260,13 @@ def run(args) -> int:
                         except Exception:
                             pass
 
-                if feed_fd is not None and bruno.speech is None:
-                    try:
-                        chunk = os.read(feed_fd, 256)
-                    except (BlockingIOError, OSError):
-                        chunk = b""
-                    if chunk:
-                        try:
-                            os.ftruncate(feed_fd, 0)
-                            os.lseek(feed_fd, 0, os.SEEK_SET)
-                        except OSError:
-                            pass
-                        offering = chunk.decode("utf-8", errors="replace").strip()
+                if bruno.speech is None:
+                    offering = feed_mod.read_offering(feed_fds)
+                    if offering:
                         try:
                             if food.is_food(offering):
                                 bruno.feed()
-                            elif offering:
+                            else:
                                 bruno.burp(offering)
                         except Exception:
                             pass
@@ -1386,9 +1361,9 @@ def run(args) -> int:
                 os.close(hook_fd)
             except OSError:
                 pass
-        if feed_fd is not None:
+        for fd in feed_fds:
             try:
-                os.close(feed_fd)
+                os.close(fd)
             except OSError:
                 pass
         if hook_install is not None:

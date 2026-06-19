@@ -12,6 +12,7 @@ import tty
 from contextlib import contextmanager
 
 from . import llm as llm_mod
+from . import feed as feed_mod
 from . import food, mouse as mouse_mod, render, say, state, tmux
 from .creature import Bruno, IDLE, WALK, SLEEP, HUNGRY, HAPPY, SQUISH, LOOK
 
@@ -108,6 +109,20 @@ def _resolve_llm_backend_pane(args, persisted: dict) -> str:
 
 
 def main() -> int:
+    # `echo 🍎 | bruno` (or any non-tty stdin) feeds the running bruno
+    # instead of launching a new overlay — the overlay needs a tty stdin
+    # anyway, so piped input is unambiguously a feed.
+    if not sys.stdin.isatty():
+        offering = sys.stdin.read().strip()
+        if offering:
+            path = feed_mod.send(offering)
+            if path:
+                verb = "fed" if food.is_food(offering) else "tossed"
+                print(f"{verb} bruno: {offering}")
+                return 0
+            print("no writable bruno feed path", file=sys.stderr)
+            return 1
+
     parser = argparse.ArgumentParser(
         prog="bruno",
         description="a dot-blob tamagotchi that lives in your terminal",
@@ -181,16 +196,7 @@ def main() -> int:
     llm_next_call_at = time.monotonic() + 5.0
     llm_last_hash = ""
 
-    feed_path = os.path.join(
-        os.environ.get("XDG_RUNTIME_DIR") or "/tmp",
-        "bruno_feed",
-    )
-    feed_fd: int | None = None
-    try:
-        feed_fd = os.open(feed_path, os.O_RDWR | os.O_CREAT | os.O_NONBLOCK, 0o600)
-        os.ftruncate(feed_fd, 0)
-    except OSError:
-        feed_fd = None
+    feed_fds = feed_mod.open_readers()
 
     with render.screen(), cbreak_stdin() as fd:
         mouse_on = False
@@ -293,22 +299,13 @@ def main() -> int:
                                 reactor.request(snippet)
                         llm_next_call_at = time.monotonic() + llm_interval_s
 
-                if feed_fd is not None and bruno.speech is None:
-                    try:
-                        chunk = os.read(feed_fd, 256)
-                    except (BlockingIOError, OSError):
-                        chunk = b""
-                    if chunk:
-                        try:
-                            os.ftruncate(feed_fd, 0)
-                            os.lseek(feed_fd, 0, os.SEEK_SET)
-                        except OSError:
-                            pass
-                        offering = chunk.decode("utf-8", errors="replace").strip()
+                if bruno.speech is None:
+                    offering = feed_mod.read_offering(feed_fds)
+                    if offering:
                         try:
                             if food.is_food(offering):
                                 bruno.feed()
-                            elif offering:
+                            else:
                                 bruno.burp(offering)
                         except Exception:
                             pass
@@ -354,9 +351,9 @@ def main() -> int:
                     os.write(sys.stdout.fileno(), mouse_mod.DISABLE)
                 except OSError:
                     pass
-            if feed_fd is not None:
+            for fd in feed_fds:
                 try:
-                    os.close(feed_fd)
+                    os.close(fd)
                 except OSError:
                     pass
 
